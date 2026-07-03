@@ -4,6 +4,8 @@ from vllm.model_executor.models.registry import (
     _ModelRegistry,
 )
 
+from vllm_omni.model_executor.models.vieneu.registry import VIENEU_MODELS
+
 _OMNI_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
@@ -157,6 +159,8 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    ## VieNeu-TTS-v2
+    **VIENEU_MODELS,
 }
 
 

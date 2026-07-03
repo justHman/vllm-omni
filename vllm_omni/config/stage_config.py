@@ -238,6 +238,7 @@ class StageConfigFactory:
         "glm-image": "glm_image",
         "cosyvoice3": "cosyvoice3",
         "mammothmoda2": "mammoth_moda2",
+        "vieneu": "vieneu",
     }
 
     # Fallback: map HF architecture class names to pipeline dirs.
@@ -510,6 +511,63 @@ class StageConfigFactory:
             edges=edges,
         )
 
+    # Marker token that only exists in VieNeu-TTS checkpoints' tokenizer
+    # vocabulary (see docs/Architecture.md Part B.3). VieNeu's config.json
+    # deliberately declares plain model_type="qwen3" /
+    # architectures=["Qwen3ForCausalLM"] (it is not distinguishable from a
+    # generic Qwen3 LM on those fields alone), so pipeline resolution falls
+    # back to this tokenizer-vocabulary heuristic instead of requiring the
+    # checkpoint's config.json to be edited.
+    _VIENEU_MARKER_TOKEN = "<|SPEECH_GENERATION_START|>"
+
+    @classmethod
+    def _is_plain_qwen3(
+        cls,
+        model_type: str | None,
+        hf_config: Any = None,
+        config_dict: dict[str, Any] | None = None,
+    ) -> bool:
+        """True when model_type/architectures alone look like a generic Qwen3 LM.
+
+        This is the ambiguous case that needs the tokenizer heuristic below
+        to tell apart a genuine Qwen3 checkpoint from VieNeu-TTS.
+        """
+        if model_type != "qwen3":
+            return False
+        architectures: list[str] = []
+        if hf_config is not None:
+            architectures = list(getattr(hf_config, "architectures", None) or [])
+        elif config_dict is not None:
+            architectures = list(config_dict.get("architectures") or [])
+        return not architectures or "Qwen3ForCausalLM" in architectures
+
+    @classmethod
+    def _looks_like_vieneu_tts(cls, model: str) -> bool:
+        """Disambiguate a VieNeu-TTS checkpoint from a vanilla Qwen3 LM.
+
+        Reads the checkpoint's tokenizer files (already fetched/cached by
+        the config lookup above, so this is a cheap local-cache hit for HF
+        Hub models) and checks for VieNeu's distinctive control tokens.
+        A plain Qwen3 checkpoint never has these.
+        """
+        try:
+            from vllm.transformers_utils.config import get_hf_file_to_dict
+
+            tok_cfg = get_hf_file_to_dict("tokenizer_config.json", model, revision=None) or {}
+            added_tokens = tok_cfg.get("added_tokens_decoder") or {}
+            if any(
+                isinstance(tok, dict) and tok.get("content") == cls._VIENEU_MARKER_TOKEN
+                for tok in added_tokens.values()
+            ):
+                return True
+
+            special_map = get_hf_file_to_dict("special_tokens_map.json", model, revision=None) or {}
+            if cls._VIENEU_MARKER_TOKEN in str(special_map):
+                return True
+        except Exception as e:
+            logger.debug(f"VieNeu-TTS tokenizer heuristic failed for {model}: {e}")
+        return False
+
     @classmethod
     def _auto_detect_model_type(cls, model: str, trust_remote_code: bool = True) -> tuple[str | None, Any]:
         """Auto-detect model_type from model directory.
@@ -525,7 +583,10 @@ class StageConfigFactory:
             from vllm.transformers_utils.config import get_config
 
             hf_config = get_config(model, trust_remote_code=trust_remote_code)
-            return hf_config.model_type, hf_config
+            model_type = hf_config.model_type
+            if cls._is_plain_qwen3(model_type, hf_config=hf_config) and cls._looks_like_vieneu_tts(model):
+                return "vieneu", hf_config
+            return model_type, hf_config
         except Exception:
             pass
 
@@ -536,7 +597,10 @@ class StageConfigFactory:
 
             config_dict = get_hf_file_to_dict("config.json", model, revision=None)
             if config_dict and "model_type" in config_dict:
-                return config_dict["model_type"], None
+                model_type = config_dict["model_type"]
+                if cls._is_plain_qwen3(model_type, config_dict=config_dict) and cls._looks_like_vieneu_tts(model):
+                    return "vieneu", None
+                return model_type, None
         except Exception as e:
             logger.debug(f"Failed to auto-detect model type for {model}: {e}")
 

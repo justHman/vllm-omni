@@ -37,6 +37,11 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.model_executor.models.vieneu.config import (
+            VieNeuCodecConfig,
+            VieNeuConfig,
+            VieNeuTalkerConfig,
+        )
         from vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts import (
             VoxtralTTSConfig,
         )
@@ -57,6 +62,9 @@ def _register_omni_hf_configs() -> None:
         ("cosyvoice3", CosyVoice3Config),
         ("omnivoice", OmniVoiceConfig),
         ("voxtral_tts", VoxtralTTSConfig),
+        ("vieneu", VieNeuConfig),
+        ("vieneu_talker", VieNeuTalkerConfig),
+        ("vieneu_codec", VieNeuCodecConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
