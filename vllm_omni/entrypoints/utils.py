@@ -9,6 +9,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
+from vllm_omni.config.stage_config import StageConfigFactory
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.platforms import current_omni_platform
@@ -203,6 +204,10 @@ def resolve_model_config_path(model: str) -> str:
     try:
         hf_config = get_config(model, trust_remote_code=True)
         model_type = hf_config.model_type
+        if StageConfigFactory._is_plain_qwen3(model_type, hf_config=hf_config) and StageConfigFactory._looks_like_vieneu_tts(
+            model
+        ):
+            model_type = "vieneu"
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
         if file_or_path_exists(model, "model_index.json", revision=None):
@@ -219,6 +224,10 @@ def resolve_model_config_path(model: str) -> str:
                 config_dict = get_hf_file_to_dict("config.json", model, revision=None)
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
+                    if StageConfigFactory._is_plain_qwen3(model_type, config_dict=config_dict) and StageConfigFactory._looks_like_vieneu_tts(
+                        model
+                    ):
+                        model_type = "vieneu"
                 else:
                     raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
             except Exception as e:

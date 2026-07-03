@@ -16,10 +16,14 @@ from vllm_omni.plugins import load_omni_general_plugins
 logger = init_logger(__name__)
 
 # Maps model architecture names to their HuggingFace model_type values.
-# Used when auto-injecting hf_overrides for models with missing config.json.
+# Used when auto-injecting hf_overrides for models with missing/ambiguous
+# config.json (e.g. CosyVoice3 empty config, VieNeu-TTS shipping plain
+# Qwen3 config.json but requiring stage-specific VieNeu config wrappers).
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
     "OmniVoiceModel": "omnivoice",
+    "VieNeuTalkerForConditionalGeneration": "vieneu_talker",
+    "VieNeuCodecDecoder": "vieneu_codec",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.

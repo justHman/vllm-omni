@@ -17,6 +17,7 @@ reference SDK does it (docs/Architecture.md Part B.1/B.4).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -170,6 +171,13 @@ class VieNeuCodecDecoder(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
         return None
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The decode-side NeuCodec weights live in the external
+        # ``neuphonic/neucodec`` repo and are lazy-loaded by _ensure_codec_loaded().
+        # There are intentionally no weights to load from the VieNeu-TTS-v2
+        # checkpoint for this vLLM generation-stage wrapper.
+        return set()
 
     def _split_request_ids(self, ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
         """Split concatenated input_ids into per-request segments.
