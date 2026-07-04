@@ -90,11 +90,82 @@ if qwen3_omni_path not in sys.modules:
     qwen3_omni_stub._validate_stage_inputs = _validate_stage_inputs  # type: ignore[attr-defined]
     sys.modules[qwen3_omni_path] = qwen3_omni_stub
 
+# ``vllm_omni.data_entry_keys`` is imported by the module under test for the
+# OmniPayloadStruct / CodesStruct / MetaStruct payload schema. The real module
+# needs msgspec + torch; stub it with tiny dataclass-like stand-ins so the test
+# stays hermetic (no torch/msgspec required). The stub exposes the same attribute
+# access shape (``.codes.audio``, ``.meta.left_context_size``) the processor uses.
+if "vllm_omni.data_entry_keys" not in sys.modules:
+    dek_stub = types.ModuleType("vllm_omni.data_entry_keys")
+
+    class _Simple:
+        """Tiny mutable attribute bag mirroring a msgspec.Struct field set."""
+
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class CodesStruct(_Simple):
+        pass
+
+    class MetaStruct(_Simple):
+        pass
+
+    class OmniPayloadStruct(_Simple):
+        pass
+
+    def to_struct(payload):  # noqa: D401
+        return payload
+
+    dek_stub.CodesStruct = CodesStruct  # type: ignore[attr-defined]
+    dek_stub.MetaStruct = MetaStruct  # type: ignore[attr-defined]
+    dek_stub.OmniPayloadStruct = OmniPayloadStruct  # type: ignore[attr-defined]
+    dek_stub.to_struct = to_struct  # type: ignore[attr-defined]
+    sys.modules["vllm_omni.data_entry_keys"] = dek_stub
+
+# ``torch`` is imported by the module under test (for torch.tensor / torch.empty
+# when building the codes.audio tensor). Provide a minimal stub that supports
+# the two calls used: tensor(list, dtype=...) and empty(n, dtype=...).
+if "torch" not in sys.modules:
+    torch_stub = types.ModuleType("torch")
+
+    class _DType:
+        def __init__(self, name):
+            self.name = name
+
+    class _Tensor:
+        def __init__(self, data, dtype=None):
+            self.data = list(data) if hasattr(data, "__iter__") else data
+            self.dtype = dtype
+
+        def __iter__(self):
+            return iter(self.data)
+
+        def __len__(self):
+            return len(self.data)
+
+        def numel(self):
+            return len(self.data)
+
+    torch_stub.long = _DType("long")
+    torch_stub.float32 = _DType("float32")
+
+    def _tensor(data, dtype=None):
+        return _Tensor(data, dtype=dtype)
+
+    def _empty(n, dtype=None):
+        return _Tensor([], dtype=dtype)
+
+    torch_stub.tensor = _tensor  # type: ignore[attr-defined]
+    torch_stub.empty = _empty  # type: ignore[attr-defined]
+    sys.modules["torch"] = torch_stub
+
 # Now import the module under test -- its top-level imports resolve to the stubs.
 from vllm_omni.model_executor.stage_input_processors.vieneu import (  # noqa: E402
     _to_codec_code_ids,
     talker2codec_async_chunk,
 )
+from vllm_omni.data_entry_keys import OmniPayloadStruct  # noqa: E402
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -188,13 +259,19 @@ class TestTalker2codecAsyncChunk:
 
         result = talker2codec_async_chunk(tm, pooling_output=None, request=req, is_finished=False)
         assert result is not None
-        assert isinstance(result["code_predictor_codes"], list)
-        # Codes are in raw codec space (offset applied).
-        assert all(isinstance(c, int) for c in result["code_predictor_codes"])
+        # v0.22.0 returns an OmniPayloadStruct (NOT a plain dict) — the adapter
+        # reads result.codes.audio / result.meta.left_context_size as attributes.
+        assert isinstance(result, OmniPayloadStruct)
+        audio = result.codes.audio
+        # Codes are in raw codec space (offset applied), carried as a tensor/list.
+        codes = list(audio.data) if hasattr(audio, "data") else list(audio)
+        assert all(isinstance(c, int) for c in codes)
         # 25 codes in the chunk + up to 25 left-context frames preceding -> <= 50.
-        assert len(result["code_predictor_codes"]) <= 50
-        assert result["finished"] is False
-        assert isinstance(result["left_context_size"], int)
+        assert len(codes) <= 50
+        # The adapter overwrites meta.finished after this returns, so the
+        # processor intentionally does NOT set it; left_context_size is set.
+        assert hasattr(result.meta, "left_context_size")
+        assert isinstance(result.meta.left_context_size, int)
 
     def test_finished_with_leftover_emits_final_chunk(self):
         tm = FakeTM()
@@ -203,24 +280,37 @@ class TestTalker2codecAsyncChunk:
 
         result = talker2codec_async_chunk(tm, pooling_output=None, request=req, is_finished=False)
         assert result is not None
-        assert result["finished"] is True
-        assert result["code_predictor_codes"]  # non-empty leftover
-        assert all(isinstance(c, int) for c in result["code_predictor_codes"])
+        assert isinstance(result, OmniPayloadStruct)
+        audio = result.codes.audio
+        codes = list(audio.data) if hasattr(audio, "data") else list(audio)
+        assert codes  # non-empty leftover
+        assert all(isinstance(c, int) for c in codes)
 
-    def test_finished_with_no_codes_returns_empty(self):
+    def test_finished_with_no_codes_returns_empty_sentinel(self):
         tm = FakeTM()
-        # No generated speech-token ids at all and finished.
+        # No generated speech-token ids at all and finished -> finish-only
+        # sentinel struct (empty codes, left_context_size=0). The adapter fills
+        # meta.finished/is_segment_finished from is_finished afterwards.
         req = FakeRequest("r4", token_ids=[], finished=True)
 
         result = talker2codec_async_chunk(tm, pooling_output=None, request=req, is_finished=False)
-        assert result == {"code_predictor_codes": [], "finished": True}
+        assert isinstance(result, OmniPayloadStruct)
+        audio = result.codes.audio
+        codes = list(audio.data) if hasattr(audio, "data") else list(audio)
+        assert codes == []
+        assert result.meta.left_context_size == 0
 
     def test_uses_is_finished_flag_when_request_not_finished(self):
-        """The explicit ``is_finished`` arg overrides request.is_finished()=False."""
+        """The explicit ``is_finished`` arg overrides request.is_finished()=False.
+
+        The processor itself does not write meta.finished (the adapter does that
+        after the call), so this test only checks that a chunk is emitted rather
+        than None — the finished flag is applied downstream by the adapter.
+        """
         tm = FakeTM()
         req = FakeRequest("r5", token_ids=_speech_ids(10), finished=False)
 
         # is_finished=True passed explicitly even though request says False.
         result = talker2codec_async_chunk(tm, pooling_output=None, request=req, is_finished=True)
         assert result is not None
-        assert result["finished"] is True
+        assert isinstance(result, OmniPayloadStruct)

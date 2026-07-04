@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from vllm.logger import init_logger
+
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 
 logger = init_logger(__name__)
 
@@ -79,7 +83,7 @@ def talker2codec_async_chunk(
     pooling_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     """Async processor: stream generated speech-token ids to the codec stage.
 
     Unlike qwen3_tts/fish_speech there is no multimodal side-channel carrying
@@ -87,6 +91,15 @@ def talker2codec_async_chunk(
     so we slice request.output_token_ids / request.all_token_ids directly,
     convert only the newly arrived speech-token ids into raw NeuCodec codes,
     then emit overlapped frame windows for stage-1 decode.
+
+    Returns an ``OmniPayloadStruct`` (NOT a plain dict) because v0.22.0's
+    ``OmniChunkTransferAdapter._send_single_request`` reads ``payload_data.meta``
+    as a struct attribute and overwrites ``payload_data.meta.finished`` /
+    ``.is_segment_finished``. Returning the v0.19-era flat dict
+    ``{"code_predictor_codes":..., "finished":...}`` crashed that adapter with
+    ``'dict' object has no attribute 'meta'``. The struct round-trips through
+    the SHM connector (msgspec encode -> decode back to struct on the receive
+    side, where the scheduler reads it as a dict via the wire-erased decoder).
     """
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
@@ -112,10 +125,13 @@ def talker2codec_async_chunk(
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     if length <= 0:
         if finished:
-            return {
-                "code_predictor_codes": [],
-                "finished": True,
-            }
+            # Finish-only sentinel: no new codec frames, just signal completion.
+            # The adapter still sets meta.finished/is_segment_finished below, so
+            # we only need an empty-codes struct here.
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(left_context_size=0),
+            )
         return None
 
     if chunk_size <= 0 or left_context_size_config < 0:
@@ -133,8 +149,13 @@ def talker2codec_async_chunk(
     left_context_size = max(0, int(end_index - context_length))
     window_codes = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    return {
-        "code_predictor_codes": list(window_codes),
-        "left_context_size": left_context_size,
-        "finished": finished,
-    }
+    # v0.22.0 omni payload schema (matches qwen3_tts/fish_speech struct path):
+    #   codes.audio       -- consumed by _payload_audio_codes -> code_predictor_codes
+    #   meta.left_context_size -- consumed by _extract_scheduling_metadata ->
+    #                              runtime_additional_information for the codec stage
+    # The adapter overwrites meta.finished/is_segment_finished after this returns,
+    # so we do NOT set those here (avoids a tensor/bool type clash).
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor(window_codes, dtype=torch.long)),
+        meta=MetaStruct(left_context_size=left_context_size),
+    )
