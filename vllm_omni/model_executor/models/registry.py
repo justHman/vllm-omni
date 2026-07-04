@@ -5,6 +5,8 @@ from vllm.model_executor.models.registry import (
     _resolve_module_name,
 )
 
+from vllm_omni.model_executor.models.vieneu.registry import VIENEU_MODELS
+
 _OMNI_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
@@ -285,6 +287,8 @@ _OMNI_MODELS = {
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
     ),
+    ## VieNeu-TTS-v2
+    **VIENEU_MODELS,
 }
 
 

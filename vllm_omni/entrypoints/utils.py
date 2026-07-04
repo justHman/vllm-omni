@@ -251,6 +251,10 @@ def resolve_model_config_path(model: str) -> str:
     try:
         hf_config = get_config(model, trust_remote_code=True)
         model_type = hf_config.model_type
+        if StageConfigFactory._is_plain_qwen3(
+            model_type, hf_config=hf_config
+        ) and StageConfigFactory._looks_like_vieneu_tts(model):
+            model_type = "vieneu"
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
         if file_or_path_exists(model, "model_index.json", revision=None):
@@ -267,6 +271,10 @@ def resolve_model_config_path(model: str) -> str:
                 config_dict = get_hf_file_to_dict("config.json", model, revision=None)
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
+                    if StageConfigFactory._is_plain_qwen3(
+                        model_type, config_dict=config_dict
+                    ) and StageConfigFactory._looks_like_vieneu_tts(model):
+                        model_type = "vieneu"
                 else:
                     # For models with empty config.json (e.g. CosyVoice3),
                     # try matching against registered omni stage configs.

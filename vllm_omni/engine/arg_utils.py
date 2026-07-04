@@ -22,6 +22,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "GLMTTSForConditionalGeneration": "glm_tts",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "VieNeuTalkerForConditionalGeneration": "vieneu_talker",
+    "VieNeuCodecDecoder": "vieneu_codec",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
@@ -42,6 +44,11 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
+        from vllm_omni.model_executor.models.vieneu.config import (
+            VieNeuConfig,
+            VieNeuTalkerConfig,
+            VieNeuCodecConfig,
+        )
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
@@ -60,6 +67,9 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("vieneu", VieNeuConfig),
+        ("vieneu_talker", VieNeuTalkerConfig),
+        ("vieneu_codec", VieNeuCodecConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)

@@ -77,6 +77,7 @@ _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
 _MOSS_TTS_FULL_MODEL_STAGES = {"moss_tts", "moss_tts_codec"}
 _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
+_VIENEU_TTS_MODEL_STAGES = {"vieneu_talker"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -90,6 +91,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MOSS_TTS_MODEL_STAGES
     | _MOSS_TTS_FULL_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
+    | _VIENEU_TTS_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -596,6 +598,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "higgs_audio_v2"
         if model_stage in _GLM_TTS_MODEL_STAGES:
             return "glm_tts"
+        if model_stage in _VIENEU_TTS_MODEL_STAGES:
+            return "vieneu"
         return None
 
     def _get_custom_voice_dir(self) -> str | None:
@@ -668,6 +672,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return set()
             if self._tts_model_type == "voxcpm2":
                 return {"default"}
+            if self._tts_model_type == "vieneu":
+                model_path = self.engine_client.model_config.model
+                voices_path = cached_file(model_path, "voices.json")
+                if voices_path is not None and os.path.exists(voices_path):
+                    from vllm_omni.model_executor.models.vieneu.processor import load_presets
+
+                    return {name.lower() for name in load_presets(voices_path).keys()}
+                return set()
             if self._tts_model_type == "voxtral_tts":
                 config = self.engine_client.model_config.hf_config.audio_config
             else:
@@ -1283,6 +1295,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_moss_tts_request(request)
         if self._tts_model_type == "glm_tts":
             return self._validate_glm_tts_request(request)
+        if self._tts_model_type == "vieneu":
+            return self._validate_vieneu_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _validate_voxcpm2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
@@ -1820,6 +1834,47 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return f"max_new_tokens must be >= {_TTS_MAX_NEW_TOKENS_MIN}"
             if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
                 return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+        return None
+
+    def _validate_vieneu_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate VieNeu-TTS-v2 request parameters."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        if request.task_type is not None and request.task_type != "Base":
+            return "VieNeu only supports Base-style voice cloning/preset TTS via /v1/audio/speech"
+
+        if request.instructions is not None and request.instructions.strip():
+            return "VieNeu v2 emotion/style instructions are not wired yet; omit 'instructions'"
+
+        if request.speaker_embedding is not None:
+            return "VieNeu does not support speaker_embedding; use 'voice' presets or ref_audio+ref_text"
+
+        if request.x_vector_only_mode is not None:
+            return "VieNeu does not support x_vector_only_mode"
+
+        if request.language is not None and request.language.strip().lower() not in {"auto", "vi", "en", "vietnamese", "english"}:
+            return "VieNeu language must be one of: Auto, vi, en, Vietnamese, English"
+
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+            if not request.ref_text or not request.ref_text.strip():
+                return "Voice cloning from ref_audio requires a matching 'ref_text' transcript"
+
+        if request.voice is None:
+            request.voice = "Ly"
+
+        if request.voice is not None and self.supported_speakers and request.voice.lower() not in self.supported_speakers:
+            return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+
         return None
 
     async def _build_higgs_audio_v2_params(self, request: OpenAICreateSpeechRequest):
@@ -2564,6 +2619,78 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         return sampling_params_list
 
+    # ---- VieNeu-TTS helpers ----
+
+    async def _build_vieneu_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        """Build VieNeu prompt tokens from preset voice, ref_audio, or default."""
+        from transformers import AutoTokenizer
+
+        from vllm_omni.model_executor.models.vieneu.processor import (
+            ReferenceVoice,
+            build_prompts_for_text,
+            load_presets,
+        )
+
+        model_name = self.engine_client.model_config.model
+        if self._tts_tokenizer is None:
+            self._tts_tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                padding_side="left",
+            )
+
+        language = (request.language or "auto").lower()
+        if language == "vietnamese":
+            language = "vi"
+        elif language == "english":
+            language = "en"
+
+        if request.ref_audio is not None and request.voice is None:
+            from vllm_omni.model_executor.models.vieneu.codec import encode_ref_audio
+
+            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+            ref_codes = encode_ref_audio(wav_list, sr)
+            reference = ReferenceVoice(ref_codes=ref_codes, ref_text=request.ref_text)
+            voice_name = "ref_audio"
+        else:
+            voices_path = cached_file(model_name, "voices.json")
+            if voices_path is None:
+                raise ValueError("VieNeu voices.json not found; preset voice prompting is unavailable")
+            presets = load_presets(voices_path)
+            presets_by_lower = {name.lower(): voice for name, voice in presets.items()}
+            voice_name = (request.voice or "Ly").lower()
+            if voice_name not in presets_by_lower:
+                raise ValueError(f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(presets))}")
+            reference = presets_by_lower[voice_name]
+
+        prompts = build_prompts_for_text(
+            request.input,
+            reference=reference,
+            tokenizer=self._tts_tokenizer,
+            language=language,
+        )
+        if not prompts:
+            raise ValueError("VieNeu prompt construction produced no chunks")
+        if len(prompts) > 1:
+            logger.warning(
+                "VieNeu multi-chunk input produced %d chunks; serving only the first chunk "
+                "until multi-request join is wired.",
+                len(prompts),
+            )
+
+        prompt_ids = self._tts_tokenizer(prompts[0].text, padding=False)["input_ids"]
+        return {
+            "prompt_token_ids": prompt_ids,
+            "additional_information": {
+                "voice": voice_name,
+                "chunk_index": prompts[0].chunk_index,
+                "chunk_count": prompts[0].chunk_count,
+            },
+        }
+
     # ---- GLM-TTS helpers ----
 
     async def _build_glm_tts_prompt(
@@ -2822,6 +2949,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     additional = prompt.setdefault("additional_information", {})
                     additional["voice_name"] = voice_lower
                     additional["voice_created_at"] = self._voice_created_at(voice_lower)
+        elif self._tts_model_type == "vieneu":
+            prompt = await self._build_vieneu_prompt(request)
+            tts_params = {}
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
@@ -2932,6 +3062,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "higgs_audio_v2"
         elif self._tts_model_type == "glm_tts":
             model_type = "glm_tts"
+        elif self._tts_model_type == "vieneu":
+            model_type = "vieneu"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:

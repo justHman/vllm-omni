@@ -1,0 +1,113 @@
+# Stage config for running VieNeu-TTS-v2 with the 2-stage omni runtime.
+#
+# VieNeu-TTS-v2 (pnnbao-ump/VieNeu-TTS-v2) is a Qwen3-backbone TTS that
+# decodes NeuCodec FSQ speech tokens to waveform. Architecture:
+#   Stage 0 (vieneu_talker): Qwen3 AR talker -> NeuCodec speech-token ids
+#   Stage 1 (vieneu_codec) : NeuCodec decode -> 24kHz mono audio
+#
+# This is the LEGACY OmegaConf stage config consumed by the rc1 serve path
+# (``vllm serve ... --omni`` -> ``resolve_model_config_path`` ->
+#  ``load_stage_configs_from_yaml`` reads ``stage_args:``). The new-format
+# ``model_executor/models/vieneu/pipeline.yaml`` (``stages:`` key) is kept for
+# the forward-looking ``StageConfigFactory`` path and the hermetic yaml test;
+# both files mirror each other field-for-field, exactly like qwen3_tts ships
+# both ``stage_configs/qwen3_tts.yaml`` and ``models/qwen3_tts/pipeline.yaml``.
+#
+# Verified target: Colab T4 (16GB), single GPU, both stages on device 0.
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      max_num_seqs: 10
+      model_stage: vieneu_talker
+      model_arch: VieNeuTalkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      hf_overrides:
+        architectures: [VieNeuTalkerForConditionalGeneration]
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      gpu_memory_utilization: 0.25
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 512
+      max_model_len: 2048
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.vieneu.talker2codec_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      top_k: 50
+      max_tokens: 2048
+      min_tokens: 50
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.2
+      # <|SPEECH_GENERATION_END|> id 381 -- stop when the talker emits it
+      # (NOT the tokenizer's generic EOS id 375).
+      stop_token_ids: [381]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      max_num_seqs: 1
+      model_stage: vieneu_codec
+      model_arch: VieNeuCodecDecoder
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      hf_overrides:
+        architectures: [VieNeuCodecDecoder]
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.1
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 16
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+        # NeuCodec runs at 50 Hz; 25 frames ~ 0.5s of audio.
+        codec_chunk_frames: 25
+        codec_left_context_frames: 25
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

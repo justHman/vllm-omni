@@ -90,6 +90,14 @@ minicpmo = [
     "stepaudio2-minicpmo",
 ]
 
+# VieNeu-TTS-v2 runtime deps — only needed when serving VieNeu-TTS models.
+# sea-g2p: Vietnamese/English text normalization + G2P phonemization.
+# neucodec: NeuCodec neural audio codec (single FSQ codebook).
+vieneu = [
+    "sea-g2p",
+    "neucodec",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
