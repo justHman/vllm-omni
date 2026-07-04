@@ -85,9 +85,17 @@ def load_presets(voices_json_path: str | Path) -> dict[str, ReferenceVoice]:
     meta = data.get("meta") or {}
     license_note = meta.get("license")
 
+    # voices.json layout: top-level "presets" wrapper (v2 checkpoint ships
+    # {"meta":..., "default_voice":"Ly", "presets":{name:{codes,text,...}}}).
+    # Older flat layouts ({name:{codes,text,...}} at top level) are also
+    # accepted for backward compatibility.
+    entries = data.get("presets")
+    if not isinstance(entries, dict):
+        entries = data
+
     presets: dict[str, ReferenceVoice] = {}
-    for name, entry in data.items():
-        if name == "meta" or not isinstance(entry, dict):
+    for name, entry in entries.items():
+        if name in ("meta", "default_voice") or not isinstance(entry, dict):
             continue
         codes = entry.get("codes")
         text = entry.get("text")

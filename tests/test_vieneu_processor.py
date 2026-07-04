@@ -203,3 +203,29 @@ class TestLoadPresets:
         assert presets["Tuyen"].ref_text == "tam biet"
         # The meta key is NOT treated as a voice.
         assert "meta" not in presets
+
+    def test_loads_voices_from_presets_wrapper(self, tmp_path: Path):
+        # v2 checkpoint ships voices.json as
+        # {"meta":..., "default_voice":"Ly", "presets":{name:{codes,text,...}}}
+        # — the real preset dict is nested under "presets", not at top level.
+        voices = {
+            "meta": {"license": "CC BY-NC 4.0"},
+            "default_voice": "Ly",
+            "presets": {
+                "Ly": {"codes": [10, 20], "text": "tham khao", "description": "Ly (nam)"},
+                "Ngoc": {"codes": [30, 40], "text": "xin chao", "podcast": "True"},
+            },
+        }
+        path = tmp_path / "voices.json"
+        path.write_text(json.dumps(voices), encoding="utf-8")
+
+        presets = load_presets(path)
+
+        assert set(presets.keys()) == {"Ly", "Ngoc"}
+        assert presets["Ly"].ref_codes == [10, 20]
+        assert presets["Ly"].ref_text == "tham khao"
+        assert presets["Ngoc"].ref_codes == [30, 40]
+        # "meta" / "default_voice" / "presets" wrappers are NOT treated as voices.
+        assert "meta" not in presets
+        assert "default_voice" not in presets
+        assert "presets" not in presets
