@@ -19,9 +19,14 @@ stages:
       enforce_eager: false
       trust_remote_code: true
       async_scheduling: true
-      enable_prefix_caching: false
+      # Prefix caching ON for the talker only — it has a KV cache, so caching
+      # repeated text/ref-audio prefixes is a net throughput win. Do NOT enable
+      # globally: the codec stage (stage 1) has no attention layers, and a
+      # global --enable_prefix_caching makes vllm pick HybridKVCacheCoordinator
+      # which asserts >1 attention group -> crash on the codec stage.
+      enable_prefix_caching: true
       engine_output_type: latent
-      gpu_memory_utilization: 0.08
+      gpu_memory_utilization: 0.45
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 512
       max_model_len: 2048

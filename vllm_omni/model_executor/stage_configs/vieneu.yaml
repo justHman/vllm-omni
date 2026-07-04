@@ -32,9 +32,11 @@ stage_args:
       enforce_eager: false
       trust_remote_code: true
       async_scheduling: true
-      enable_prefix_caching: false
+      # Prefix caching ON for the talker only (see pipeline.yaml note).
+      # Do NOT enable globally — codec stage has no attention layers.
+      enable_prefix_caching: true
       engine_output_type: latent
-      gpu_memory_utilization: 0.25
+      gpu_memory_utilization: 0.45
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 512
       max_model_len: 2048
