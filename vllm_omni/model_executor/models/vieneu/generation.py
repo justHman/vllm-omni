@@ -173,7 +173,39 @@ class VieNeuTalkerForConditionalGeneration(nn.Module):
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs={})
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The VieNeu-TTS-v2 checkpoint ships with `tie_word_embeddings: True`
+        # and NO `lm_head.weight` tensor in the safetensors file -- the LM
+        # head is meant to share weights with `model.embed_tokens.weight`.
+        # AutoWeightsLoader does NOT auto-tie for this custom wrapper (stock
+        # vLLM Qwen3ForCausalLM does it via its own load_weights path we
+        # don't inherit), so without this the LM head stays zero-initialized
+        # and compute_logits returns all-zero logits -> sampler picks random
+        # speech tokens, stop token 381 never fires, talker runs to
+        # max_tokens (LENGTH_CAPPED) producing 65-80s of garbage audio.
+        # Mirror fish_speech_slow_ar's tied-embeddings handling: when we see
+        # the embedding weight, also load it into the LM head.
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded: set[str] = set()
+        tie = bool(getattr(self.config, "tie_word_embeddings", False))
+
+        # We must intercept embed_tokens before AutoWeightsLoader consumes
+        # the iterator, so materialize it (VieNeu is a 1.5B model -- the
+        # embed tensor is ~50MB, fine to hold twice briefly).
+        weights_list = list(weights)
+
+        for name, loaded_weight in weights_list:
+            if tie and name == "model.embed_tokens.weight":
+                lm_key = "lm_head.weight"
+                if lm_key in params_dict:
+                    p = params_dict[lm_key]
+                    wl = getattr(p, "weight_loader", None)
+                    if wl is not None:
+                        wl(p, loaded_weight)
+                    else:
+                        p.data.copy_(loaded_weight)
+                    loaded.add(lm_key)
+
         loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(weights)
-        logger.info("Loaded %d weights for VieNeuTalkerForConditionalGeneration", len(loaded))
+        loaded |= loader.load_weights(weights_list)
+        logger.info("Loaded %d weights for VieNeuTalkerForConditionalGeneration (tie=%s)", len(loaded), tie)
         return loaded
