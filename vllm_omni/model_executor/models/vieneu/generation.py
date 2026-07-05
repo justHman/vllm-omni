@@ -112,7 +112,39 @@ class VieNeuTalkerForConditionalGeneration(nn.Module):
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None:
             return None
-        return logits.masked_fill(~self._speech_allowed_mask, float("-inf"))
+        masked = logits.masked_fill(~self._speech_allowed_mask, float("-inf"))
+
+        # [DEBUG-VIENEU] Per-step probe of stop-token 381 logits vs the top-k=50
+        # cutoff. HF generate stops at ~252 tokens but vLLM v0.22.0 runs to
+        # max_tokens without ever emitting 381. This log reveals whether 381
+        # ever enters the top-50 sampleable set, or is always crowded out by
+        # the 65536 speech tokens. Gated to the first 20 steps + every 50th
+        # after, to bound log volume. Runs in the WORKER subprocess.
+        if not getattr(self, "_dbg_step", 0):
+            self._dbg_step = 0
+        step = self._dbg_step
+        self._dbg_step += 1
+        if step < 20 or step % 50 == 0:
+            try:
+                last = masked[-1]  # [vocab]
+                stop_logit = float(last[self.config.speech_generation_end_id].item())
+                # top-50 cutoff among allowed (non -inf) tokens
+                allowed_vals = last[self._speech_allowed_mask]
+                if allowed_vals.numel() > 0:
+                    k = min(50, allowed_vals.numel())
+                    topk_vals, _ = allowed_vals.topk(k)
+                    cutoff = float(topk_vals[-1].item())
+                    rank_of_stop = int((allowed_vals > stop_logit).sum().item())
+                    logger.warning(
+                        "[DEBUG-VIENEU] step=%d stop381_logit=%.4f top50_cutoff=%.4f "
+                        "stop_rank_in_allowed=%d (0=top) stop_in_top50=%s",
+                        step, stop_logit, cutoff, rank_of_stop,
+                        bool(stop_logit >= cutoff),
+                    )
+            except Exception:
+                pass
+
+        return masked
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         """Wrap raw hidden states into the shared ``OmniOutput`` contract.
