@@ -50,7 +50,12 @@ stage_args:
       gpu_memory_utilization: 0.45
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 512
-      max_model_len: 2048
+      # Reference SDK max_context=2048 is prompt+output total. vLLM's
+      # max_model_len caps prompt+output too, but max_tokens caps output
+      # alone — set both generously so the talker has room to emit stop 381
+      # before being LENGTH_CAPPED. HF generate with this prompt stops at
+      # ~252 output tokens, so 4096 headroom is plenty.
+      max_model_len: 4096
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.vieneu.talker2codec_async_chunk
     output_connectors:
       to_stage_1: connector_of_shared_memory
@@ -61,11 +66,13 @@ stage_args:
       # repetition_penalty or top_p — adding rep_penalty=1.2 put sampling
       # off-distribution and suppressed stop token 381 so the talker ran to
       # max_model_len (LENGTH_CAPPED) emitting 1648 garbage speech tokens.
+      # top_p=1.0 set explicitly because vLLM's default top_p may differ
+      # from HF's implicit 1.0 and that alone changes the trajectory.
       temperature: 1.0
+      top_p: 1.0
       top_k: 50
       max_tokens: 2048
       min_tokens: 50
-      seed: 42
       detokenize: false
       # <|SPEECH_GENERATION_END|> id 381 -- stop when the talker emits it
       # (NOT the tokenizer's generic EOS id 375).
