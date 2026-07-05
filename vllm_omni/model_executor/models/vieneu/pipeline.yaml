@@ -119,7 +119,14 @@ connectors:
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
       codec_chunk_frames: 25
-      codec_left_context_frames: 25
+      # left_context_frames=0: each chunk is decoded standalone with no
+      # overlap window. The reference SDK's _infer_torch decodes all codes in
+      # one shot (no chunking), so there is no overlap to trim. With
+      # left_context=25 the codec received 50 frames per chunk and was supposed
+      # to trim 25, but the trim path doubled the audio (9.1s WAV for 4.6s of
+      # generated speech). left_context=0 makes each 25-frame chunk decode to
+      # 25 frames of audio, matching the talker's 230-frame output length.
+      codec_left_context_frames: 0
 
 edges:
   - from: 0
