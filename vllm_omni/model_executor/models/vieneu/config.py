@@ -82,13 +82,16 @@ class VieNeuTalkerConfig(PretrainedConfig):
         text_prompt_start_id: int = _DEFAULT_TEXT_PROMPT_START_ID,
         text_prompt_end_id: int = _DEFAULT_TEXT_PROMPT_END_ID,
         # Generation defaults actually used by the reference SDK's
-        # `standard.py`/`remote.py` call sites, NOT the checkpoint's own
-        # generation_config.json (see docs/Architecture.md Part B.4 -- the
-        # checkpoint file's temperature/top_k/top_p are not what upstream
-        # inference code uses).
+        # `_infer_torch` (src/vieneu/standard.py): temperature=1.0, top_k=50,
+        # min_new_tokens=50, max_length=max_context, eos_token_id=381. The
+        # reference does NOT use repetition_penalty or top_p; rep_penalty=1.2
+        # was an off-distribution guess that suppressed stop token 381 and
+        # caused LENGTH_CAPPED garbage output. Kept here only for backwards
+        # field compatibility — the YAML default_sampling_params is the source
+        # of truth at inference time.
         default_temperature: float = 1.0,
         default_top_k: int = 50,
-        default_repetition_penalty: float = 1.2,
+        default_repetition_penalty: float = 1.0,
         min_new_tokens: int = 50,
         max_context_length: int = 2048,
         **kwargs,

@@ -53,13 +53,18 @@ stages:
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
+      # Match the reference SDK's `_infer_torch` generate() call exactly
+      # (src/vieneu/standard.py): do_sample=True, temperature=1.0, top_k=50,
+      # min_new_tokens=50, eos_token_id=381. The reference does NOT use
+      # repetition_penalty or top_p — adding rep_penalty=1.2 put sampling
+      # off-distribution and suppressed stop token 381 so the talker ran to
+      # max_model_len (LENGTH_CAPPED) emitting 1648 garbage speech tokens.
       temperature: 1.0
       top_k: 50
       max_tokens: 2048
       min_tokens: 50
       seed: 42
       detokenize: false
-      repetition_penalty: 1.2
       stop_token_ids: [381]
 
   - stage_id: 1
