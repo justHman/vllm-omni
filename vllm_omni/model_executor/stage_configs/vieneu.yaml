@@ -32,6 +32,17 @@ stage_args:
       enforce_eager: false
       trust_remote_code: true
       async_scheduling: true
+      # CRITICAL: tell vLLM to NOT load the checkpoint's generation_config.json
+      # (ships eos_token_id=[375] + temperature 0.7 / top_k 20 / top_p 0.8 which
+      # override this yaml's stop_token_ids=[381] / temperature 1.0 / top_k 50 /
+      # max_tokens 2048; 375 is masked to -inf by the talker logit mask so the
+      # stop never fires and the talker runs past max_tokens to ~3270 garbage
+      # speech tokens -> 65s of noise). `generation_config: vllm` is a real
+      # vLLM EngineArgs field, survives filter_dataclass_kwargs, and is applied
+      # in the WORKER subprocess (unlike patching the APIServer-side
+      # model_config, which is lost when vllm_config is pickled to the
+      # mp-spawned worker). See pipeline.yaml for the full rationale.
+      generation_config: vllm
       # Prefix caching ON for the talker only (see pipeline.yaml note).
       # Do NOT enable globally — codec stage has no attention layers.
       enable_prefix_caching: true

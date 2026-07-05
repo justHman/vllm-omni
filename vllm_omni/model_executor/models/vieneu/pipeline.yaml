@@ -19,6 +19,25 @@ stages:
       enforce_eager: false
       trust_remote_code: true
       async_scheduling: true
+      # CRITICAL: tell vLLM to NOT load the checkpoint's generation_config.json.
+      # That file ships eos_token_id=[375] (tokenizer EOS) + temperature 0.7 /
+      # top_k 20 / top_p 0.8, which vLLM's get_diff_sampling_param merges into
+      # the stage-0 sampling defaults and overrides this yaml's
+      # default_sampling_params (stop_token_ids=[381], temperature 1.0,
+      # top_k 50, max_tokens 2048). Token 375 is masked to -inf by the talker
+      # logit mask (only [382,65918) + 381 is sampleable), so with 375 as eos
+      # the stop never fires and the talker runs past max_tokens=2048 to
+      # ~3270 garbage speech tokens -> 65s of noise.
+      #
+      # `generation_config: vllm` is a real vLLM EngineArgs field (inherited by
+      # OmniEngineArgs), so it survives filter_dataclass_kwargs and is applied
+      # inside EngineArgs.create_engine_config() in the WORKER subprocess — not
+      # just in the APIServer. This is the key difference from the previous
+      # patch_generation_config_if_needed approach, which only patched the
+      # APIServer-side model_config and was lost when vllm_config was pickled
+      # to the mp-spawned worker (the lambda attribute does not survive
+      # pickling, so the worker re-read generation_config.json from disk).
+      generation_config: vllm
       # Prefix caching ON for the talker only — it has a KV cache, so caching
       # repeated text/ref-audio prefixes is a net throughput win. Do NOT enable
       # globally: the codec stage (stage 1) has no attention layers, and a

@@ -195,72 +195,8 @@ def set_death_signal(sig: int) -> None:
         pass
 
 
-def _is_vieneu_talker_model(model_config: Any) -> bool:
-    """Detect a VieNeu-TTS-v2 talker stage's model config.
-
-    The upstream checkpoint ships a plain Qwen3 ``config.json``
-    (``model_type="qwen3"``) with a ``generation_config.json`` whose
-    ``eos_token_id=[375]`` (tokenizer EOS) overrides the vieneu yaml's
-    ``stop_token_ids=[381]`` (SPEECH_GENERATION_END). Token 375 is masked
-    to -inf by the talker's logit mask, so generation never stops and runs
-    to max length producing ~3270 garbage speech tokens (65s of noise).
-
-    Detect via either ``model_type`` (after ``hf_overrides`` sets it to
-    ``vieneu_talker``) or the registered architecture name.
-    """
-    model_type = getattr(model_config, "model_type", None)
-    if model_type == "vieneu_talker":
-        return True
-    archs = getattr(model_config, "architectures", None) or []
-    if "VieNeuTalkerForConditionalGeneration" in archs:
-        return True
-    hf_config = getattr(model_config, "hf_config", None)
-    if hf_config is not None:
-        if getattr(hf_config, "model_type", None) == "vieneu_talker":
-            return True
-        sub_archs = getattr(hf_config, "architectures", None) or []
-        if "VieNeuTalkerForConditionalGeneration" in sub_archs:
-            return True
-    return False
-
-
 def patch_generation_config_if_needed(model_config: Any) -> None:
-    """Guard InputProcessor init for models whose config lacks model_type.
-
-    For VieNeu-TTS-v2 talker stages, force ``try_get_generation_config`` to
-    return an empty dict so the checkpoint's ``generation_config.json``
-    (which ships ``eos_token_id=[375]`` + temperature 0.7 / top_k 20 /
-    top_p 0.8) does NOT override the vieneu pipeline yaml sampling params
-    (``stop_token_ids=[381]``, temperature 1.0, top_k 50). Token 375 is
-    masked to -inf by the talker logit mask (only the speech-token range
-    [382,65918) + the stop id 381 is sampleable), so with 375 as the stop
-    the model can never emit it and runs to max length producing garbage.
-
-    Detect vieneu BEFORE calling ``try_get_generation_config()``: vllm caches
-    the loaded config on the model_config, and triggering the load first
-    would populate the cache with the bad ``eos_token_id=[375]`` value before
-    we can patch the method. If a prior call already cached it, clear the
-    cache attribute too so the patched (empty) result wins downstream.
-    """
-    if _is_vieneu_talker_model(model_config):
-        logger.info(
-            "VieNeu talker detected — patching try_get_generation_config to "
-            "ignore checkpoint generation_config.json (eos_token_id=[375] "
-            "would override yaml stop_token_ids=[381] and never fire)."
-        )
-        model_config.try_get_generation_config = lambda: {}
-        # Clear any already-cached generation config (vllm stores it on the
-        # model_config after the first try_get_generation_config() call, e.g.
-        # during EngineArgs.create_engine_config). Setting it to None makes a
-        # downstream `getattr(model_config, "generation_config", None)` see no
-        # overrides, consistent with the patched empty-dict method.
-        for _attr in ("generation_config", "_generation_config"):
-            if hasattr(model_config, _attr):
-                try:
-                    setattr(model_config, _attr, None)
-                except Exception:
-                    pass
-        return
+    """Guard InputProcessor init for models whose config lacks model_type."""
     try:
         model_config.try_get_generation_config()
     except Exception:
@@ -895,15 +831,6 @@ def build_vllm_config(
         usage_context=UsageContext.LLM_CLASS,
         headless=headless,
     )
-    # Patch the talker's generation_config source ASAP after the model_config
-    # exists — EngineArgs.create_engine_config above already loaded the
-    # checkpoint's generation_config.json and may have cached its
-    # eos_token_id=[375] on model_config. For the vieneu talker this would
-    # override the yaml stop_token_ids=[381] (375 is masked to -inf by the
-    # talker logit mask => generation never stops). Calling the patch here
-    # (in addition to build_stage0_input_processor) clears the cache before
-    # any consumer reads default sampling params from generation_config.
-    patch_generation_config_if_needed(vllm_config.model_config)
     executor_class = Executor.get_class(vllm_config)
 
     # Upgrade vanilla INCConfig to OmniINCConfig for multi-stage models.
