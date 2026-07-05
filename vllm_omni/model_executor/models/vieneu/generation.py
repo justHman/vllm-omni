@@ -126,23 +126,37 @@ class VieNeuTalkerForConditionalGeneration(nn.Module):
         self._dbg_step += 1
         if step < 20 or step % 50 == 0:
             try:
-                last = masked[-1]  # [vocab]
-                stop_logit = float(last[self.config.speech_generation_end_id].item())
-                # top-50 cutoff among allowed (non -inf) tokens
-                allowed_vals = last[self._speech_allowed_mask]
-                if allowed_vals.numel() > 0:
-                    k = min(50, allowed_vals.numel())
-                    topk_vals, _ = allowed_vals.topk(k)
-                    cutoff = float(topk_vals[-1].item())
-                    rank_of_stop = int((allowed_vals > stop_logit).sum().item())
-                    logger.warning(
-                        "[DEBUG-VIENEU] step=%d stop381_logit=%.4f top50_cutoff=%.4f "
-                        "stop_rank_in_allowed=%d (0=top) stop_in_top50=%s",
-                        step, stop_logit, cutoff, rank_of_stop,
-                        bool(stop_logit >= cutoff),
-                    )
-            except Exception:
-                pass
+                # Log raw stats first to confirm we read real logits (probe v1
+                # reported 0.0000 hằng — suspect misread dim). Then per-row
+                # stop-token probe.
+                rows = masked.shape[0]
+                stop_id = self.config.speech_generation_end_id
+                mask = self._speech_allowed_mask
+                # global raw stats across whole tensor
+                finitemask = torch.isfinite(masked)
+                n_finite = int(finitemask.sum().item())
+                # argmax across vocab dim (last)
+                argmax_ids = masked.argmax(dim=-1).tolist()
+                row = masked[-1]
+                stop_logit = float(row[stop_id].item())
+                row_max = float(row.max().item())
+                row_min_finite = float(row[row != float("-inf")].min().item()) if n_finite > 0 else float("nan")
+                allowed_vals = row[mask]
+                k = min(50, allowed_vals.numel())
+                topk_vals, topk_ids = allowed_vals.topk(k)
+                cutoff = float(topk_vals[-1].item())
+                rank = int((allowed_vals > stop_logit).sum().item())
+                in_top = bool(stop_logit >= cutoff)
+                logger.warning(
+                    "[DEBUG-VIENEU] step=%d rows=%d n_finite=%d argmax_ids=%s | "
+                    "row[-1]: stop381=%.4f max=%.4f min_finite=%.4f "
+                    "top50_cutoff=%.4f stop_rank=%d in_top50=%s top1_allowed_id=%d",
+                    step, rows, n_finite, argmax_ids[:5],
+                    stop_logit, row_max, row_min_finite, cutoff, rank, in_top,
+                    int(topk_ids[0].item()),
+                )
+            except Exception as e:
+                logger.warning("[DEBUG-VIENEU] probe error step=%d: %r", step, e)
 
         return masked
 
