@@ -266,13 +266,14 @@ class VieNeuCodecDecoder(nn.Module):
             self._logged_codec_stats = True
             try:
                 c = valid_codes[0]
-                logger.info(
-                    "NeuCodec decoder: frames=%d uniq=%d range=[%d,%d] batch=%d",
+                logger.warning(
+                    "[DEBUG-VIENEU] codec first-batch: batch=%d per-request frames=%d uniq=%d "
+                    "range=[%d,%d] (decoded_samples will be frames*480 @24kHz)",
+                    len(valid_codes),
                     c.numel(),
                     int(torch.unique(c).numel()),
                     int(c.min().item()),
                     int(c.max().item()),
-                    len(valid_codes),
                 )
             except Exception:
                 pass

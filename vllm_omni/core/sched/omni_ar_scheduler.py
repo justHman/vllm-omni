@@ -421,6 +421,39 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped = True
 
             if stopped:
+                # [DEBUG-VIENEU] One log per request finish on stage-0.
+                # Reveals: did check_stop fire (LENGTH_CAPPED vs STOPPED)?
+                # at what token count? did stop_token_id 381 ever fire?
+                # num_output_tokens vs request.max_tokens — if num_output
+                # exceeds max_tokens here, check_stop is NOT being enforced
+                # for this stage (the bug we are hunting).
+                if self.vllm_config.model_config.stage_id == 0:
+                    _sp = request.sampling_params
+                    _out = getattr(request, "output_token_ids", None) or []
+                    _n381 = sum(1 for t in _out if t == 381)
+                    _n_speech = sum(1 for t in _out if 382 <= t < 65918)
+                    _n_other = len(_out) - _n381 - _n_speech
+                    logger.warning(
+                        "[DEBUG-VIENEU] stage0 req=%s FINISHED: status=%s "
+                        "finish_reason=%r stop_reason=%r | num_tokens=%r "
+                        "num_output_tokens=%r max_tokens=%r min_tokens=%r "
+                        "max_model_len=%r | output_len=%r n381=%r n_speech=%r "
+                        "n_other=%r last10=%r",
+                        req_id,
+                        request.status,
+                        finish_reason,
+                        getattr(request, "stop_reason", None),
+                        getattr(request, "num_tokens", None),
+                        getattr(request, "num_output_tokens", None),
+                        getattr(request, "max_tokens", None),
+                        getattr(_sp, "min_tokens", None) if _sp else None,
+                        getattr(self, "max_model_len", None),
+                        len(_out),
+                        _n381,
+                        _n_speech,
+                        _n_other,
+                        _out[-10:] if _out else None,
+                    )
                 if model_runner_output.routed_experts is not None:
                     routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
 

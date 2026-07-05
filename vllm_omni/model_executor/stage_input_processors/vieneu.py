@@ -107,6 +107,35 @@ def talker2codec_async_chunk(
     generated_token_ids = list(getattr(request, "output_token_ids", []) or [])
     generated_codec_codes = _to_codec_code_ids(generated_token_ids)
 
+    if finished:
+        # [DEBUG-VIENEU] Final accounting of what the talker actually emitted.
+        # generated_token_ids is the raw talker output stream; _to_codec_code_ids
+        # stops at 381 and converts [382,65918) -> [0,65536). Comparing these
+        # counts tells us whether the talker emitted 381 (stop fired) and how
+        # many garbage speech tokens leaked through -- the real number that
+        # became codec frames (and thus audio seconds).
+        _n_total = len(generated_token_ids)
+        _n381 = sum(1 for t in generated_token_ids if t == 381)
+        _first381 = generated_token_ids.index(381) if _n381 > 0 else None
+        _n_speech = sum(1 for t in generated_token_ids if 382 <= t < 65918)
+        _n_below382 = sum(1 for t in generated_token_ids if t < 382)
+        _n_above65917 = sum(1 for t in generated_token_ids if t >= 65918)
+        logger.warning(
+            "[DEBUG-VIENEU] talker2codec req=%s FINISHED: total_out=%r "
+            "n381=%r first381_at=%r n_speech=%r n_below382=%r n_above65917=%r "
+            "codec_codes_emitted=%r head10=%r tail10=%r",
+            request_id,
+            _n_total,
+            _n381,
+            _first381,
+            _n_speech,
+            _n_below382,
+            _n_above65917,
+            len(generated_codec_codes),
+            generated_token_ids[:10],
+            generated_token_ids[-10:],
+        )
+
     cached_generated_len = int(transfer_manager.request_payload.get(request_id, 0) or 0)
     current_generated_len = len(generated_codec_codes)
     new_frame_count = max(0, current_generated_len - cached_generated_len)

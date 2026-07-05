@@ -2855,6 +2855,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sampling_params_list = list(self.engine_client.default_sampling_params_list)
         sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
+        # [DEBUG-VIENEU] Dump the exact sampling params stage-0 will receive.
+        # Reveals whether yaml default_sampling_params (max_tokens/stop_token_ids/
+        # temperature/top_k/seed) actually reach the engine, or get dropped/
+        # overridden somewhere upstream. One log per request.
+        if self._tts_model_type == "vieneu" and sampling_params_list:
+            _sp0 = sampling_params_list[0]
+            logger.warning(
+                "[DEBUG-VIENEU] req=%s stage0 sampling_params BEFORE branch: "
+                "max_tokens=%r stop_token_ids=%r all_stop_token_ids=%r "
+                "temperature=%r top_k=%r top_p=%r min_tokens=%r "
+                "repetition_penalty=%r seed=%r eos_token_id=%r ignore_eos=%r "
+                "detokenize=%r",
+                request_id,
+                getattr(_sp0, "max_tokens", None),
+                getattr(_sp0, "stop_token_ids", None),
+                getattr(_sp0, "_all_stop_token_ids", None),
+                getattr(_sp0, "temperature", None),
+                getattr(_sp0, "top_k", None),
+                getattr(_sp0, "top_p", None),
+                getattr(_sp0, "min_tokens", None),
+                getattr(_sp0, "repetition_penalty", None),
+                getattr(_sp0, "seed", None),
+                getattr(_sp0, "eos_token_id", None),
+                getattr(_sp0, "ignore_eos", None),
+                getattr(_sp0, "detokenize", None),
+            )
+
         # Resolve uploaded voice for non-Qwen3 models.
         # Qwen3 TTS has its own uploaded voice handling in _build_tts_params().
         has_inline_ref_audio = request.ref_audio is not None
@@ -2952,6 +2979,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif self._tts_model_type == "vieneu":
             prompt = await self._build_vieneu_prompt(request)
             tts_params = {}
+            # [DEBUG-VIENEU] Log prompt length + ref voice info. prompt_len +
+            # max_tokens=2048 must stay under max_model_len=2048, otherwise the
+            # request gets clamped/rejected and 65s garbage can leak from the
+            # ref-voice preset being decoded as audio instead of used as a prompt.
+            _pti = prompt.get("prompt_token_ids") if isinstance(prompt, dict) else None
+            logger.warning(
+                "[DEBUG-VIENEU] req=%s vieneu prompt: prompt_token_ids_len=%r "
+                "additional_information=%r",
+                request_id,
+                len(_pti) if _pti is not None else None,
+                prompt.get("additional_information") if isinstance(prompt, dict) else None,
+            )
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
@@ -3175,6 +3214,31 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
+
+        if self._tts_model_type == "vieneu" and sampling_params_list:
+            _sp0 = sampling_params_list[0]
+            _pti = prompt.get("prompt_token_ids") if isinstance(prompt, dict) else None
+            logger.warning(
+                "[DEBUG-VIENEU] req=%s FINAL before generate: "
+                "max_tokens=%r stop_token_ids=%r all_stop_token_ids=%r "
+                "temperature=%r top_k=%r min_tokens=%r repetition_penalty=%r "
+                "seed=%r eos_token_id=%r ignore_eos=%r | prompt_len=%r "
+                "prompt_head=%r prompt_tail=%r",
+                request_id,
+                getattr(_sp0, "max_tokens", None),
+                getattr(_sp0, "stop_token_ids", None),
+                getattr(_sp0, "_all_stop_token_ids", None),
+                getattr(_sp0, "temperature", None),
+                getattr(_sp0, "top_k", None),
+                getattr(_sp0, "min_tokens", None),
+                getattr(_sp0, "repetition_penalty", None),
+                getattr(_sp0, "seed", None),
+                getattr(_sp0, "eos_token_id", None),
+                getattr(_sp0, "ignore_eos", None),
+                len(_pti) if _pti is not None else None,
+                _pti[:12] if _pti else None,
+                _pti[-12:] if _pti else None,
+            )
 
         generator = self.engine_client.generate(
             prompt=prompt,
@@ -3519,12 +3583,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            _n_bytes = len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes))
             logger.info(
                 "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
                 request_id,
                 total_ms,
-                len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
+                _n_bytes,
             )
+            # [DEBUG-VIENEU] Final WAV accounting. For a 24kHz mono int16 WAV:
+            # audio_samples = (bytes - 44) / 2, audio_seconds = samples / 24000,
+            # codec_frames = samples / 480 (NeuCodec 50Hz). Cross-check against
+            # the talker2codec finished log: codec_codes_emitted should equal
+            # codec_frames here. If not -> chunked decode overlap is leaking.
+            if self._tts_model_type == "vieneu" and isinstance(audio_bytes, (bytes, bytearray)) and _n_bytes > 44:
+                _samples = (_n_bytes - 44) // 2
+                _seconds = _samples / 24000.0
+                _frames = _samples / 480
+                logger.warning(
+                    "[DEBUG-VIENEU] req=%s WAV accounting: bytes=%d samples=%d "
+                    "seconds=%.4f codec_frames=%.1f (frames==talker_tokens iff no overlap leak)",
+                    request_id, _n_bytes, _samples, _seconds, _frames,
+                )
             return Response(content=audio_bytes, media_type=media_type)
 
         except asyncio.CancelledError:
