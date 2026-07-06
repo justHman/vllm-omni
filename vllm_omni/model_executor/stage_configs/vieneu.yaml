@@ -128,11 +128,15 @@ runtime:
         connector_get_sleep_s: 0.01
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
-        # codec_chunk_frames=65536: decode all codes in ONE shot at finish
-        # (matches reference SDK _infer_torch). Streaming 25-frame chunks
-        # created boundary clicks ("bụm"). One decode = no boundaries.
-        codec_chunk_frames: 65536
-        codec_left_context_frames: 0
+        # Incremental streaming decode (25-frame chunks, 25-frame left-context
+        # overlap trimmed off the decoded waveform). See pipeline.yaml for the
+        # full rationale. Requires the codec.py meta-key fix; without it the
+        # left_context_size was always 0 and chunks doubled the audio.
+        codec_chunk_frames: 25
+        codec_left_context_frames: 25
+        # ONE-SHOT FALLBACK (clean audio, no incremental streaming):
+        #   codec_chunk_frames: 65536
+        #   codec_left_context_frames: 0
 
   edges:
     - from: 0
