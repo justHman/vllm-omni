@@ -128,25 +128,28 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      # Incremental streaming decode: each 25-frame chunk (~0.5s @ 50Hz) is
-      # decoded with a 25-frame left-context window and the context frames are
-      # trimmed off the decoded waveform (codec.py ctx_frames branch, same
-      # overlap-trim pattern as fish_speech's DAC decoder). The conv-decoder is
-      # position-invariant, so the suffix of [ctx + new] reproduces the
-      # standalone decode of `new` and stitches seamlessly with the previous
-      # chunk's tail -- no boundary clicks ("bụm"). Previously this path
-      # produced clicks because codec.py read the wrong meta key
-      # (left_context_size always 0 -> no trim -> full ctx+chunk emitted every
-      # chunk = audio doubling, see commit f2cd6d8a). With the key fix,
-      # chunk_frames=25 + left_context_frames=25 now streams cleanly.
-      codec_chunk_frames: 25
-      codec_left_context_frames: 25
-      # ONE-SHOT FALLBACK (clean audio, no incremental streaming, TTFB ~= total):
-      #   codec_chunk_frames: 65536
-      #   codec_left_context_frames: 0
-      # Decodes all generated codes in a single decode_code call at finish,
-      # matching the reference SDK's _infer_torch. Use if streaming-decode
-      # regressions appear.
+      # ONE-SHOT decode (default): decode all generated codes in a single
+      # decode_code call at finish, matching the reference SDK's _infer_torch.
+      # Clean audio, no boundary clicks. Trade-off: audio is not emitted
+      # incrementally (the streaming response sends the whole clip at end,
+      # TTFB ~= total).
+      #
+      # The codec.py meta-key fix (info['meta']['left_context_size']) is kept,
+      # so the streaming path WORKS mechanically -- but NeuCodec is a causal
+      # conv decoder (unlike fish_speech's non-causal DAC), so decoding
+      # [ctx + new] and trimming the left-context frames does NOT reproduce
+      # the standalone decode of `new` (the conv's receptive field + causal
+      # padding make the suffix position-dependent). That mismatch is heard
+      # as "bụm" clicks at each chunk boundary when codec_chunk_frames is
+      # small. Until a real overlap-add crossfade is wired (crossfade the
+      # tail of chunk k with the head of chunk k+1 in the SAMPLE domain, not
+      # trim), keep one-shot for clean audio.
+      #
+      # INCREMENTAL STREAMING (experimental, has boundary clicks):
+      #   codec_chunk_frames: 25
+      #   codec_left_context_frames: 25
+      codec_chunk_frames: 65536
+      codec_left_context_frames: 0
 
 edges:
   - from: 0
