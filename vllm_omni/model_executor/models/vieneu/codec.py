@@ -13,10 +13,34 @@ NeuCodec itself is not bundled in the VieNeu-TTS-v2 checkpoint; it's a
 separate HF repo/package (``neuphonic/neucodec`` or the distilled
 ``neuphonic/distill-neucodec``) loaded independently, matching how the
 reference SDK does it (docs/Architecture.md Part B.1/B.4).
+
+Streaming boundary splice: OVERLAP-ADD CROSSFADE.
+NeuCodec is a CAUSAL conv decoder, so the suffix of a ``[ctx + new]``
+decode does NOT reproduce the standalone decode of ``new`` (the conv's
+receptive field + causal padding make the suffix position-dependent).
+The previous "trim the first ctx_frames" approach (commit 73700459)
+therefore produced "bụm" clicks at each chunk boundary: the trimmed
+boundary did not match the previous chunk's tail.
+
+The fix here is overlap-add crossfade: decode each chunk WITH left-context
+(so its head has no edge effect), then crossfade the re-decoded overlap
+with the previous chunk's buffered tail IN THE SAMPLE DOMAIN, instead of
+trimming it. ``codec_chunk_frames = C`` and ``codec_left_context_frames =
+O`` (the overlap) are configured in pipeline.yaml / stage_configs/vieneu.yaml.
+O must be >= the NeuCodec conv receptive field for a seamless splice
+(default O=25 == 0.5s @ 50Hz frame rate, matching fish_speech).
+
+The crossfade state (``prev_tail`` samples per request_id) lives on the
+decoder module itself (``self._prev_tail``). The codec stage runs in a
+single mp-worker subprocess and processes one batch per step, so per-req
+state keyed by ``req_id`` (read from ``runtime_additional_information[i]
+["req_id"]``) is safe without locking. State is cleared lazily when a
+``ctx_frames == 0`` chunk is seen for a request (one-shot / new request).
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from typing import Any
 
@@ -31,6 +55,39 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .config import VieNeuCodecConfig
 
 logger = init_logger(__name__)
+
+
+def _crossfade_window(n: int) -> torch.Tensor:
+    """Hann-shaped crossfade window of length ``n`` (linear blend, smooth ends).
+
+    ``fade_in  = sin^2(pi * t)``  (0 -> 1), with ``t = (1..n) / (2n)``
+    ``fade_out = 1 - fade_in`` = ``cos^2(pi * t)``
+
+    Two properties matter for the splice:
+      1. ``fade_in + fade_out == 1`` everywhere -- so when the two overlap
+         signals are identical (O >= receptive field), the blend is the
+         IDENTITY (``tail*fade_out + head*fade_in = head``), giving a
+         sample-exact seamless splice.
+      2. The derivative of sin^2 is zero at both endpoints (Hann shape), so
+         there is no slope discontinuity at the boundaries of the overlap
+         region -- this is what makes Hann audibly cleaner than a raw linear
+         ramp (which has a slope jump at both ends).
+
+    The trade-off vs. an equal-power (sin/cos) window is a ~3dB level dip in
+    the middle of the overlap (power = sin^4 + cos^4 dips to 0.5), which is
+    acceptable for a short 0.5s splice and is the standard behavior of a
+    Hann-shaped linear crossfade. An equal-power window would keep constant
+    power but would NOT be sample-exact for identical overlaps
+    (``sin + cos = sqrt(2)`` at the midpoint), so we pick blend-linearity
+    over equal-power to guarantee seamless splices when O >= receptive field.
+    When the two overlaps differ slightly (O < RF), the splice is a smooth
+    blend instead of a click.
+    """
+    if n <= 0:
+        return torch.empty(0, dtype=torch.float32)
+    t = torch.arange(1, n + 1, dtype=torch.float32) / (2 * n)
+    fade_in = torch.sin(math.pi * t) ** 2
+    return fade_in
 
 # Module-level singleton codec for encode_ref_audio (lazy-loaded). Kept
 # separate from VieNeuCodecDecoder._codec (the decode-side instance) so the
@@ -137,6 +194,19 @@ class VieNeuCodecDecoder(nn.Module):
         self._output_sample_rate: int = self.codec_config.sample_rate
         self._num_codebooks: int = self.codec_config.num_codebooks
         self._logged_codec_stats = False
+        # Streaming overlap-add crossfade state. Maps req_id -> (tail_samples,
+        # tail_overlap_samples). ``tail_samples`` is the last O frames worth of
+        # decoded samples from the previous chunk (the overlap that will be
+        # re-decoded with this chunk's left context). ``tail_overlap_samples``
+        # is the sample-count of that overlap (= O * samples_per_frame for the
+        # PREVIOUS chunk, kept so we can size fade_out correctly even if the
+        # codec's samples-per-frame varies slightly per decode).
+        self._prev_tail: dict[str, tuple[torch.Tensor, int]] = {}
+        # Bounded LRU-ish cleanup: never grow this dict beyond this many live
+        # requests. The codec stage is single-process and batch sizes are small
+        # (max_num_seqs=4 by default), so 64 slots is plenty of headroom; the
+        # cap just guards against a pathological req_id churn leak.
+        self._prev_tail_max = 64
 
     def _ensure_codec_loaded(self) -> None:
         """Lazily load NeuCodec from its own HF repo (not this checkpoint)."""
@@ -235,6 +305,7 @@ class VieNeuCodecDecoder(nn.Module):
         num_req = len(request_ids_list)
 
         left_context_size = [0] * num_req
+        req_ids_per_idx: list[str | None] = [None] * num_req
         if runtime_additional_information is not None:
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
@@ -252,6 +323,20 @@ class VieNeuCodecDecoder(nn.Module):
                     left_context_size[i] = int(meta["left_context_size"])
                 elif "left_context_size" in info:
                     left_context_size[i] = int(info["left_context_size"])
+                # req_id is set by GPUModelRunner._build_req_infos (gpu_model_runner.py
+                # ~line 1417: ``req_infos["req_id"] = req_id``) and reaches us here
+                # via runtime_additional_information. Used to key the per-request
+                # overlap-add crossfade buffer ``self._prev_tail``. Fall back to the
+                # batch position string when absent (e.g. dummy runtime info during
+                # capacity estimation -- gpu_generation_model_runner.py:773).
+                rid = meta.get("req_id") if isinstance(meta, dict) else None
+                if rid is None and isinstance(info, dict):
+                    rid = info.get("req_id") or info.get("request_id")
+                if isinstance(rid, (list, tuple)) and rid:
+                    rid = rid[0]
+                if rid is None:
+                    rid = f"__batch_pos_{i}"
+                req_ids_per_idx[i] = str(rid)
 
         valid_codes: list[torch.Tensor] = []
         valid_indices: list[int] = []
@@ -266,6 +351,11 @@ class VieNeuCodecDecoder(nn.Module):
             parsed_total_frames[i] = n
             valid_codes.append(req_ids)
             valid_indices.append(i)
+
+        # Track which req_ids appeared in this batch so we can lazily evict
+        # stale ``_prev_tail`` entries (defensive cap against memory growth
+        # if request_ids are reused or the finish signal never arrives).
+        seen_req_ids: set[str] = set()
 
         if not valid_codes:
             return OmniOutput(
@@ -296,28 +386,86 @@ class VieNeuCodecDecoder(nn.Module):
             codes = valid_codes[j]
             ctx_frames = parsed_ctx_frames[idx]
             total_frames = parsed_total_frames[idx]
+            rid = req_ids_per_idx[idx] or f"__batch_pos_{idx}"
+            seen_req_ids.add(rid)
 
             # NeuCodec.decode_code expects [1, 1, num_frames] integer codes.
             codes_1_1_f = codes.reshape(1, 1, -1)
             with torch.amp.autocast("cuda", enabled=False):
                 wav = self._codec.decode_code(codes_1_1_f)
-            wav = wav.reshape(-1)
+            wav = wav.reshape(-1).to(dtype=torch.float32)
 
-            if ctx_frames > 0 and total_frames > 0:
-                # Trim left-context frames proportionally, same as fish_speech's
-                # DAC decoder (docs/Architecture.md Part A.6) -- avoids
-                # re-emitting audio from the overlap window on chunked/streaming
-                # decode (see stages.py's async_chunk wiring, TASK 12).
-                # The conv-decoder is position-invariant, so the suffix of the
-                # [ctx + new] window reproduces the standalone decode of `new`
-                # and stitches seamlessly with the previous chunk's tail.
-                samples_per_frame = wav.numel() / max(total_frames, 1)
-                trim_samples = int(round(ctx_frames * samples_per_frame))
-                trim_samples = max(0, min(trim_samples, int(wav.numel()) - 1))
-                if trim_samples > 0:
-                    wav = wav[trim_samples:]
+            if ctx_frames <= 0 or total_frames <= 0:
+                # ONE-SHOT / first chunk / ctx disabled: no overlap to crossfade.
+                # Emit the full decode unchanged and clear any stale tail for
+                # this req_id (e.g. a previous streaming request whose finish
+                # signal we missed, or a one-shot fallback reusing the same id).
+                self._prev_tail.pop(rid, None)
+                audios[idx] = wav.to(dtype=torch.float32, device="cpu")
+                continue
 
-            audios[idx] = wav.to(dtype=torch.float32, device="cpu")
+            # STREAMING overlap-add crossfade.
+            # ``wav`` is the decode of ``[ctx(=O) + new(=C)]`` frames. Its first
+            # ``O * samples_per_frame`` samples are the re-decoded overlap that
+            # should match the previous chunk's tail (when O >= conv receptive
+            # field they match exactly). Crossfade those with the buffered
+            # ``prev_tail`` in the sample domain, then emit:
+            #   [crossfaded_overlap] + [remaining new samples]
+            # and buffer this chunk's tail ``O`` frames for the next crossfade.
+            samples_per_frame = wav.numel() / max(total_frames, 1)
+            overlap_samples = int(round(ctx_frames * samples_per_frame))
+            overlap_samples = max(0, min(overlap_samples, int(wav.numel()) - 1))
+
+            prev_entry = self._prev_tail.get(rid)
+            if prev_entry is None or overlap_samples <= 0:
+                # First chunk of this request (chunk 0): the connector did not
+                # feed left context for chunk 0, so ctx_frames here will be 0
+                # and we hit the branch above. Defensive fallback: if we somehow
+                # get here with no prev_tail, emit the full decode unchanged.
+                self._prev_tail[rid] = (wav[-overlap_samples:].clone().cpu(), overlap_samples)
+                audios[idx] = wav.to(dtype=torch.float32, device="cpu")
+                continue
+
+            prev_tail, prev_overlap = prev_entry
+            # Size the crossfade to the SHORTER of the two overlaps (the codec
+            # hop length can deviate slightly per decode; prev_overlap was the
+            # overlap size of the previous chunk, overlap_samples is this
+            # chunk's head overlap).
+            n_cross = min(int(prev_overlap), int(overlap_samples))
+            n_cross = max(0, min(n_cross, prev_tail.numel(), int(wav.numel())))
+
+            head_overlap = wav[:n_cross]
+            # Align prev_tail tail to ``n_cross`` samples (it may be longer if
+            # the previous chunk buffered more than we need now).
+            tail_use = prev_tail[-n_cross:] if n_cross > 0 else prev_tail[:0]
+
+            out = wav.clone()
+            if n_cross > 0:
+                fade_in = _crossfade_window(n_cross).to(head_overlap.device, head_overlap.dtype)
+                fade_out = 1.0 - fade_in
+                # Bring prev_tail onto the same device/dtype as head_overlap
+                # for the blend, then move back to cpu for the connector path.
+                tail_use_dev = tail_use.to(head_overlap.device, head_overlap.dtype)
+                out[:n_cross] = tail_use_dev * fade_out + head_overlap * fade_in
+
+            # Buffer this chunk's tail overlap for the NEXT crossfade. Keep it
+            # on CPU so the buffer doesn't pin GPU memory across chunks.
+            new_tail = wav[-overlap_samples:].clone().cpu()
+            self._prev_tail[rid] = (new_tail, int(overlap_samples))
+
+            audios[idx] = out.to(dtype=torch.float32, device="cpu")
+
+        # Lazy eviction of stale per-request crossfade state. Keep only entries
+        # for req_ids seen in this batch, plus a hard cap on the dict size.
+        if len(self._prev_tail) > self._prev_tail_max or any(
+            rid not in seen_req_ids for rid in list(self._prev_tail.keys())
+        ):
+            for rid in list(self._prev_tail.keys()):
+                if rid not in seen_req_ids:
+                    self._prev_tail.pop(rid, None)
+            # Hard cap: drop oldest by insertion order if still too large.
+            while len(self._prev_tail) > self._prev_tail_max:
+                self._prev_tail.pop(next(iter(self._prev_tail)))
 
         return OmniOutput(
             text_hidden_states=None,
