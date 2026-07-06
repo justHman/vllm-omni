@@ -410,9 +410,18 @@ class OmniSchedulingCoordinator:
                 new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
                 runtime_seed = None
                 if "left_context_size" in metadata:
-                    runtime_seed = {
-                        "meta": {"left_context_size": metadata["left_context_size"]},
+                    meta_seed: dict[str, Any] = {
+                        "left_context_size": metadata["left_context_size"],
                     }
+                    # Propagate the segment-finished flag so downstream codec
+                    # decoders (vieneu OLA crossfade) know this is the FINAL
+                    # chunk and emit the buffered overlap tail instead of
+                    # re-buffering it (which would cut ~0.5s off the clip end).
+                    if "is_segment_finished" in metadata:
+                        meta_seed["is_segment_finished"] = metadata["is_segment_finished"]
+                    if "stream_finished" in metadata:
+                        meta_seed["stream_finished"] = metadata["stream_finished"]
+                    runtime_seed = {"meta": meta_seed}
                 request._omni_initial_model_buffer = runtime_seed
                 if new_ids:
                     request.prompt_token_ids = new_ids

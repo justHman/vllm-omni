@@ -456,6 +456,22 @@ class OmniConnectorModelRunnerMixin:
         elif "left_context_size" in payload:
             logger.warning_once("legacy flat 'left_context_size' key in payload; expected 'meta.left_context_size'")
 
+        # Propagate the segment/stream-finished flags so downstream codec
+        # decoders (vieneu OLA crossfade) can detect the FINAL chunk and emit
+        # the buffered overlap tail instead of cutting ~0.5s off the clip end.
+        for _fin_key in ("is_segment_finished", "stream_finished"):
+            if _fin_key in meta and meta[_fin_key] is not None:
+                v = meta[_fin_key]
+                if isinstance(v, bool):
+                    extracted[_fin_key] = v
+                elif hasattr(v, "item"):
+                    try:
+                        extracted[_fin_key] = bool(v.item())
+                    except Exception:
+                        extracted[_fin_key] = bool(v)
+                else:
+                    extracted[_fin_key] = bool(v)
+
         return extracted
 
     _NON_CONSUMABLE_PAYLOAD_KEYS: set[tuple[str, str]] = {

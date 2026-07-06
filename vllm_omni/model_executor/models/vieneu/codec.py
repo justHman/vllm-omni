@@ -317,6 +317,7 @@ class VieNeuCodecDecoder(nn.Module):
 
         left_context_size = [0] * num_req
         req_ids_per_idx: list[str | None] = [None] * num_req
+        is_final_chunk: list[bool] = [False] * num_req
         if runtime_additional_information is not None:
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
@@ -334,6 +335,30 @@ class VieNeuCodecDecoder(nn.Module):
                     left_context_size[i] = int(meta["left_context_size"])
                 elif "left_context_size" in info:
                     left_context_size[i] = int(info["left_context_size"])
+                # Final-chunk flag: when the talker emits stop 381 the stage-0
+                # processor sets is_segment_finished/stream_finished on the
+                # payload meta, which the coordinator now propagates into
+                # runtime_seed.meta. The codec uses this to emit the buffered
+                # overlap tail (instead of re-buffering it for a next chunk
+                # that never comes) -- otherwise ~0.5s of audio is lost at the
+                # end of every request and the stale _prev_tail leaks into the
+                # next request with the same req_id (echo at the end).
+                fin = False
+                for _k in ("is_segment_finished", "stream_finished"):
+                    if _k in meta and meta[_k]:
+                        v = meta[_k]
+                        if isinstance(v, bool):
+                            fin = v
+                        elif hasattr(v, "item"):
+                            try:
+                                fin = bool(v.item())
+                            except Exception:
+                                fin = bool(v)
+                        else:
+                            fin = bool(v)
+                        if fin:
+                            break
+                is_final_chunk[i] = fin
                 # req_id is set by GPUModelRunner._build_req_infos (gpu_model_runner.py
                 # ~line 1417: ``req_infos["req_id"] = req_id``) and reaches us here
                 # via runtime_additional_information. Used to key the per-request
@@ -398,6 +423,7 @@ class VieNeuCodecDecoder(nn.Module):
             ctx_frames = parsed_ctx_frames[idx]
             total_frames = parsed_total_frames[idx]
             rid = req_ids_per_idx[idx] or f"__batch_pos_{idx}"
+            final = is_final_chunk[idx]
             seen_req_ids.add(rid)
 
             # NeuCodec.decode_code expects [1, 1, num_frames] integer codes.
@@ -416,11 +442,14 @@ class VieNeuCodecDecoder(nn.Module):
                 # (codec_left_context_frames) stashed on the module at init.
                 # For true one-shot (huge total_frames) we clear stale tail.
                 o_cfg = int(getattr(self, "_ola_overlap_frames", 0))
-                if o_cfg > 0 and 0 < total_frames <= 4 * o_cfg:
-                    # chunk 0 of streaming: emit ONLY the non-overlap part
-                    # (C - O samples); the last O samples are buffered as
-                    # prev_tail so chunk 1 can crossfade against them. This
-                    # prevents the overlap from being emitted twice (echo).
+                if o_cfg > 0 and 0 < total_frames <= 4 * o_cfg and not final:
+                    # chunk 0 of streaming (NOT the final chunk): emit ONLY the
+                    # non-overlap part (C - O samples); the last O samples are
+                    # buffered as prev_tail so chunk 1 can crossfade against
+                    # them. This prevents the overlap from being emitted twice
+                    # (echo). If this chunk is ALSO the final chunk (very short
+                    # request that fits in one chunk), fall through to the
+                    # one-shot branch below -- emit the full decode, no buffer.
                     seed_o = min(o_cfg, total_frames)
                     spf = wav.numel() / max(total_frames, 1)
                     seed_samples = max(0, min(int(round(seed_o * spf)), int(wav.numel())))
@@ -431,7 +460,8 @@ class VieNeuCodecDecoder(nn.Module):
                     emit_wav = wav[: int(wav.numel()) - seed_samples] if seed_samples > 0 else wav
                     audios[idx] = emit_wav.to(dtype=torch.float32, device="cpu")
                 else:
-                    # One-shot: clear stale tail, emit full decode unchanged.
+                    # One-shot OR the only-chunk-of-a-short-request: clear
+                    # stale tail, emit full decode unchanged.
                     self._prev_tail.pop(rid, None)
                     audios[idx] = wav.to(dtype=torch.float32, device="cpu")
                 continue
@@ -460,12 +490,17 @@ class VieNeuCodecDecoder(nn.Module):
             prev_entry = self._prev_tail.get(rid)
             if prev_entry is None or overlap_samples <= 0:
                 # No prev_tail yet: emit the non-overlap part only (no splice)
-                # and buffer the tail O for the next chunk.
-                self._prev_tail[rid] = (
-                    wav[-overlap_samples:].clone().cpu() if overlap_samples > 0 else wav[:0].clone().cpu(),
-                    int(overlap_samples),
-                )
-                audios[idx] = wav[overlap_samples:].to(dtype=torch.float32, device="cpu")
+                # and buffer the tail O for the next chunk -- UNLESS this is the
+                # final chunk, in which case emit the full decode (no buffer).
+                if final:
+                    self._prev_tail.pop(rid, None)
+                    audios[idx] = wav.to(dtype=torch.float32, device="cpu")
+                else:
+                    self._prev_tail[rid] = (
+                        wav[-overlap_samples:].clone().cpu() if overlap_samples > 0 else wav[:0].clone().cpu(),
+                        int(overlap_samples),
+                    )
+                    audios[idx] = wav[overlap_samples:].to(dtype=torch.float32, device="cpu")
                 continue
 
             prev_tail, prev_overlap = prev_entry
@@ -481,10 +516,15 @@ class VieNeuCodecDecoder(nn.Module):
             # the previous chunk buffered more than we need now).
             tail_use = prev_tail[-n_cross:] if n_cross > 0 else prev_tail[:0]
 
-            # Emit [crossfaded overlap (O)] + [middle non-overlap (C-O)].
-            # ``middle`` excludes both the head overlap AND the tail overlap
-            # (the tail overlap is buffered for chunk k+1, NOT emitted here).
-            if overlap_samples > 0:
+            # Emit [crossfaded overlap (O)] + [middle non-overlap (C-O)] + tail.
+            # For a MIDDLE chunk the tail overlap (last O samples) is buffered
+            # for chunk k+1's crossfade and NOT emitted (prevents echo). For the
+            # FINAL chunk there is no chunk k+1, so the tail MUST be emitted too
+            # -- otherwise ~0.5s of audio is cut at the end and the stale
+            # _prev_tail leaks into the next request with the same req_id (echo
+            # at the end). Emitting the tail on the final chunk recovers the
+            # last O samples and clears the buffer.
+            if overlap_samples > 0 and not final:
                 middle = wav[n_cross : int(wav.numel()) - overlap_samples]
             else:
                 middle = wav[n_cross:]
@@ -497,10 +537,15 @@ class VieNeuCodecDecoder(nn.Module):
             else:
                 out = middle
 
-            # Buffer this chunk's tail overlap for the NEXT crossfade. Keep it
-            # on CPU so the buffer doesn't pin GPU memory across chunks.
-            new_tail = wav[-overlap_samples:].clone().cpu() if overlap_samples > 0 else wav[:0].clone().cpu()
-            self._prev_tail[rid] = (new_tail, int(overlap_samples))
+            if final:
+                # Last chunk: emit everything (tail included), clear the buffer
+                # so it can't leak into the next request with this req_id.
+                self._prev_tail.pop(rid, None)
+            else:
+                # Buffer this chunk's tail overlap for the NEXT crossfade. Keep
+                # it on CPU so the buffer doesn't pin GPU memory across chunks.
+                new_tail = wav[-overlap_samples:].clone().cpu() if overlap_samples > 0 else wav[:0].clone().cpu()
+                self._prev_tail[rid] = (new_tail, int(overlap_samples))
 
             audios[idx] = out.to(dtype=torch.float32, device="cpu")
 
