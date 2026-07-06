@@ -132,16 +132,16 @@ runtime:
         # See pipeline.yaml for the full rationale (NeuCodec causal conv ->
         # trim does not reproduce standalone decode -> boundary clicks ->
         # crossfade the overlap region in the SAMPLE domain instead).
-        #   codec_chunk_frames = C = 50 (1.0s @ 50Hz)
-        #   codec_left_context_frames = O = 50 (overlap, also 1.0s)
-        # TTFB ~ (C+O) * samples_per_frame / 24000 ~= 1.0-1.5s, NO clicks.
-        # Larger C/O (vs earlier 25/25) halves decode calls -> ~10-15% throughput
-        # on cold/concurrent, trading TTFB. O must be >= NeuCodec conv RF.
+        #   codec_chunk_frames = C = 25 (0.5s @ 50Hz)
+        #   codec_left_context_frames = O = 25 (overlap, also 0.5s)
+        # TTFB ~ (C+O) * samples_per_frame / 24000 ~= 0.5-1.0s, NO clicks.
+        # C=50/O=50 tested: serial warm faster but concurrent throughput
+        # regressed (codec GPU occupied longer per call). 25/25 is balanced.
         # ONE-SHOT FALLBACK (clean audio, no streaming, TTFB ~= total):
         #   codec_chunk_frames: 65536
         #   codec_left_context_frames: 0
-        codec_chunk_frames: 50
-        codec_left_context_frames: 50
+        codec_chunk_frames: 25
+        codec_left_context_frames: 25
 
   edges:
     - from: 0
