@@ -83,14 +83,14 @@ stage_args:
     runtime:
       devices: "0"
     engine_args:
-      max_num_seqs: 1
+      max_num_seqs: 4
       model_stage: vieneu_codec
       model_arch: VieNeuCodecDecoder
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       hf_overrides:
         architectures: [VieNeuCodecDecoder]
-      enforce_eager: true
+      enforce_eager: false
       trust_remote_code: true
       async_scheduling: true
       enable_prefix_caching: false
@@ -128,12 +128,10 @@ runtime:
         connector_get_sleep_s: 0.01
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
-        # NeuCodec runs at 50 Hz; 25 frames ~ 0.5s of audio.
-        # left_context_frames=0: decode each chunk standalone (no overlap
-        # window) -- matches reference SDK _infer_torch which decodes all
-        # codes in one shot. left_context=25 doubled the audio because the
-        # trim path emitted the full 50-frame window per 25-frame chunk.
-        codec_chunk_frames: 25
+        # codec_chunk_frames=65536: decode all codes in ONE shot at finish
+        # (matches reference SDK _infer_torch). Streaming 25-frame chunks
+        # created boundary clicks ("bụm"). One decode = no boundaries.
+        codec_chunk_frames: 65536
         codec_left_context_frames: 0
 
   edges:

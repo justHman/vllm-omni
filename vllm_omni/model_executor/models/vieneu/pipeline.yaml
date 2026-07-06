@@ -85,11 +85,18 @@ stages:
     runtime:
       devices: "0"
     engine_args:
-      max_num_seqs: 1
+      # Allow concurrent codec decodes so multiple TTS requests don't
+      # serialize on the codec stage. NeuCodec decode is cheap (single
+      # FSQ codebook, no attention) so 4-way concurrency is safe on T4.
+      max_num_seqs: 4
       model_arch: VieNeuCodecDecoder
       hf_overrides:
         architectures: [VieNeuCodecDecoder]
-      enforce_eager: true
+      # enforce_eager=false lets vLLM compile the codec forward graph.
+      # NeuCodec decode_code is a small conv-decoder -- compile gives a
+      # modest latency win per decode call. (Was eager because codec has
+      # no attention/KV cache, but compile still helps the conv layers.)
+      enforce_eager: false
       trust_remote_code: true
       async_scheduling: true
       enable_prefix_caching: false
@@ -118,14 +125,14 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 25
-      # left_context_frames=0: each chunk is decoded standalone with no
-      # overlap window. The reference SDK's _infer_torch decodes all codes in
-      # one shot (no chunking), so there is no overlap to trim. With
-      # left_context=25 the codec received 50 frames per chunk and was supposed
-      # to trim 25, but the trim path doubled the audio (9.1s WAV for 4.6s of
-      # generated speech). left_context=0 makes each 25-frame chunk decode to
-      # 25 frames of audio, matching the talker's 230-frame output length.
+      # codec_chunk_frames=65536: decode all generated codes in ONE shot at
+      # finish, matching the reference SDK's _infer_torch (single decode_code
+      # call). Streaming chunk decode (25 frames) created boundary
+      # discontinuities heard as "bụm" clicks between chunks. With one decode
+      # there are no boundaries. Trade-off: audio is not emitted incrementally
+      # (the streaming response sends the whole clip at end). Set this large
+      # enough that length % chunk_size != 0 until finish triggers the emit.
+      codec_chunk_frames: 65536
       codec_left_context_frames: 0
 
 edges:
