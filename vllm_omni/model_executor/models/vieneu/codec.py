@@ -388,10 +388,8 @@ class VieNeuCodecDecoder(nn.Module):
             valid_codes.append(req_ids)
             valid_indices.append(i)
 
-        # Track which req_ids appeared in this batch so we can lazily evict
-        # stale ``_prev_tail`` entries (defensive cap against memory growth
-        # if request_ids are reused or the finish signal never arrives).
-        seen_req_ids: set[str] = set()
+        # (per-request crossfade state is retained across batches -- see the
+        # retention comment below the loop; no seen-set needed for eviction.)
 
         if not valid_codes:
             return OmniOutput(
@@ -424,7 +422,6 @@ class VieNeuCodecDecoder(nn.Module):
             total_frames = parsed_total_frames[idx]
             rid = req_ids_per_idx[idx] or f"__batch_pos_{idx}"
             final = is_final_chunk[idx]
-            seen_req_ids.add(rid)
 
             # NeuCodec.decode_code expects [1, 1, num_frames] integer codes.
             codes_1_1_f = codes.reshape(1, 1, -1)
@@ -549,17 +546,19 @@ class VieNeuCodecDecoder(nn.Module):
 
             audios[idx] = out.to(dtype=torch.float32, device="cpu")
 
-        # Lazy eviction of stale per-request crossfade state. Keep only entries
-        # for req_ids seen in this batch, plus a hard cap on the dict size.
-        if len(self._prev_tail) > self._prev_tail_max or any(
-            rid not in seen_req_ids for rid in list(self._prev_tail.keys())
-        ):
-            for rid in list(self._prev_tail.keys()):
-                if rid not in seen_req_ids:
-                    self._prev_tail.pop(rid, None)
-            # Hard cap: drop oldest by insertion order if still too large.
-            while len(self._prev_tail) > self._prev_tail_max:
-                self._prev_tail.pop(next(iter(self._prev_tail)))
+        # Bounded retention of per-request crossfade state. We do NOT evict
+        # entries whose req_id is absent from the CURRENT batch: with async
+        # streaming, multiple requests interleave across batches (batch 1:
+        # req X chunk k + req Y chunk k; batch 2: req Y chunk k+1; batch 3:
+        # req X chunk k+1). Evicting req X just because it wasn't in batch 2
+        # would DROP its prev_tail -> req X chunk k+1 then hits the no-prev_tail
+        # defensive branch and emits raw wav[overlap:] with NO crossfade ->
+        # audible artifact ("background voice" / lost splice at the boundary).
+        # The final chunk clears its own entry via _prev_tail.pop(rid) above
+        # (final=True branch), so entries don't leak across requests. The hard
+        # cap below is just a backstop against pathological req_id churn.
+        while len(self._prev_tail) > self._prev_tail_max:
+            self._prev_tail.pop(next(iter(self._prev_tail)))
 
         return OmniOutput(
             text_hidden_states=None,

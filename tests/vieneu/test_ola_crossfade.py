@@ -397,6 +397,85 @@ def test_final_chunk_emits_tail_and_clears_buffer() -> None:
     )
 
 
+def test_interleaved_streaming_retains_prev_tail_across_batches() -> None:
+    # INTERLEAVED STREAMING GUARD: with async scheduling, two requests X and Y
+    # interleave across codec batches (batch 1: X chunk k + Y chunk k;
+    # batch 2: Y chunk k+1; batch 3: X chunk k+1). The previous eviction logic
+    # dropped _prev_tail[X] just because X wasn't in batch 2 -> X chunk k+1
+    # then had no prev_tail -> emitted raw wav[overlap:] with NO crossfade ->
+    # audible "background voice" artifact at the X chunk boundary. This test
+    # simulates the interleaving (a separate "batch" call per chunk, with the
+    # OTHER request absent) and verifies the prev_tail for the absent request
+    # is RETAINED so its next chunk can crossfade.
+    C, O = 25, 25
+    spf = 480
+    N = C * 3  # 75 frames per request
+    tx = np.arange(N * spf, dtype=np.float32) / 24000.0
+    full_x = np.sin(2 * np.pi * 220.0 * tx).astype(np.float32)
+    full_y = np.sin(2 * np.pi * 330.0 * tx).astype(np.float32)
+
+    # Per-request prev_tail state, keyed by rid (mirrors codec.self._prev_tail).
+    state: dict[str, tuple[np.ndarray, int] | None] = {"X": None, "Y": None}
+
+    def emit_chunk(rid: str, k: int, full: np.ndarray) -> np.ndarray:
+        start = max(0, k * C - O)
+        end = min(N, start + O + C)
+        wav = full[start * spf : end * spf]
+        ctx = (k * C) - start
+        tf = end - start
+        is_final = (k == (N // C) - 1)
+        if k == 0:
+            emit, tail, ov = crossfade_chunk(
+                wav, ctx_frames=0, total_frames=tf, prev_tail=None,
+                prev_overlap=0, is_chunk0=True, final=is_final,
+            )
+        else:
+            pt, po = state[rid] or (None, 0)
+            emit, tail, ov = crossfade_chunk(
+                wav, ctx_frames=ctx, total_frames=tf,
+                prev_tail=pt, prev_overlap=po, final=is_final,
+            )
+        state[rid] = (tail, ov) if tail is not None else None
+        return emit
+
+    # Simulate interleaved batches: X0, Y0, Y1, X1, X2, Y2 (X1 arrives after Y1,
+    # so X is absent from the "Y1 batch" -- the old eviction would drop X).
+    emit_x0 = emit_chunk("X", 0, full_x)
+    emit_y0 = emit_chunk("Y", 0, full_y)
+    emit_y1 = emit_chunk("Y", 1, full_y)   # X absent from this "batch"
+    emit_x1 = emit_chunk("X", 1, full_x)   # must still have prev_tail from X0
+    emit_x2 = emit_chunk("X", 2, full_x)   # final
+    emit_y2 = emit_chunk("Y", 2, full_y)   # final
+
+    # X1 must have crossfaded against X0's tail (not the no-prev_tail defensive
+    # branch). The defensive branch emits wav[overlap_samples:] (C samples with
+    # NO crossfade); the crossfade branch emits [crossfaded O] + [middle..end-ish]
+    # which, for identical overlap, reproduces the reference exactly. If X's
+    # prev_tail had been evicted, X1 would emit the wrong region. Check that X1
+    # reproduces the reference (full_x[(C-O)*spf : ...]).
+    # X1 decode is full_x[(C-O)*spf : (C-O+O+C)*spf]; emit should be C*spf that
+    # equals full_x[(C-O)*spf : (2C-O)*spf] when overlap matches (identity).
+    expected_x1 = full_x[(C - O) * spf : (2 * C - O) * spf]
+    assert emit_x1.shape[0] == C * spf, f"X1 emit {emit_x1.shape[0]} != C*spf={C * spf}"
+    delta = float(np.max(np.abs(emit_x1 - expected_x1)))
+    # Allow small float32 slack (sin accumulation + crossfade window rounding).
+    # The old eviction bug would produce a FULL-amplitude mismatch (delta ~ 1.0)
+    # because X1 would emit the wrong region with no crossfade; a sub-1e-3 delta
+    # means the crossfade happened against the retained prev_tail.
+    assert delta < 1e-3, (
+        f"X1 crossfade broken (prev_tail evicted?): delta={delta} "
+        f"-- interleaved streaming lost the splice"
+    )
+    # Both final chunks must have cleared their state.
+    assert state["X"] is None and state["Y"] is None, (
+        f"final chunks must clear state, got X={state['X'] is not None} Y={state['Y'] is not None}"
+    )
+    print(
+        f"[PASS] test_interleaved_streaming_retains_prev_tail_across_batches "
+        f"(X1 splice delta={delta:.2e} after Y1-only batch)"
+    )
+
+
 def main() -> int:
     test_crossfade_window_blend_and_smoothness()
     test_crossfade_identical_overlap_is_sample_exact()
@@ -406,6 +485,7 @@ def main() -> int:
     test_first_chunk_ctx_zero_seeds_tail()
     test_no_echo_total_emit_equals_input_frames()
     test_final_chunk_emits_tail_and_clears_buffer()
+    test_interleaved_streaming_retains_prev_tail_across_batches()
     print("\nALL OLA CROSSFADE SELF-CHECKS PASSED")
     return 0
 
