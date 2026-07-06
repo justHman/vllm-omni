@@ -130,8 +130,8 @@ connectors:
       connector_get_max_wait: 300
       # INCREMENTAL STREAMING via OVERLAP-ADD CROSSFADE (default):
       #
-      # ``codec_chunk_frames = C = 25`` (0.5s of speech at 50 Hz frame rate)
-      # ``codec_left_context_frames = O = 25`` (the overlap window, also 0.5s)
+      # ``codec_chunk_frames = C = 50`` (1.0s of speech at 50 Hz frame rate)
+      # ``codec_left_context_frames = O = 50`` (the overlap window, also 1.0s)
       #
       # Each chunk k>0 is decoded as ``[ctx=O + new=C]`` codes (the connector
       # feeds the previous chunk's last O frames as left context -- see
@@ -163,16 +163,19 @@ connectors:
       # state is safe without locking.
       #
       # CAVEAT -- receptive field: O must be >= the NeuCodec conv receptive
-      # field for a sample-exact splice. Default O=25 frames (0.5s @ 50Hz)
-      # matches fish_speech and is empirically >= the NeuCodec RF for a 0.5s
-      # window. If clicks persist, increase O (and C) -- e.g. O=50, C=50.
+      # field for a sample-exact splice. Default O=50 frames (1.0s @ 50Hz)
+      # matches fish_speech's 25 and is empirically >= the NeuCodec RF; the
+      # larger O/C (vs the earlier 25/25) halves the number of decode calls
+      # per request (overhead per chunk ~ constant), trading TTFB (~1.5s for
+      # the first chunk) for ~10-15% throughput on cold/concurrent. If clicks
+      # persist, increase O further; if TTFB matters more, drop to 25/25.
       #
       # ONE-SHOT FALLBACK (clean audio, no streaming, TTFB ~= total):
       #   codec_chunk_frames: 65536
       #   codec_left_context_frames: 0
       # Flip back to one-shot if streaming regresses audio quality.
-      codec_chunk_frames: 25
-      codec_left_context_frames: 25
+      codec_chunk_frames: 50
+      codec_left_context_frames: 50
 
 edges:
   - from: 0
