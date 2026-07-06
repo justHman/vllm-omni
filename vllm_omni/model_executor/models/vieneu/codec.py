@@ -239,8 +239,19 @@ class VieNeuCodecDecoder(nn.Module):
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
                     break
-                if "left_context_size" in info:
-                    left_context_size[i] = info["left_context_size"]
+                # The connector / scheduling-coordinator delivers left_context_size
+                # nested under "meta" (see omni_scheduling_coordinator.update_request_metadata:
+                # runtime_seed = {"meta": {"left_context_size": ...}} and fish_speech's
+                # DAC decoder reads the same path). Reading the flat top-level key was a
+                # bug: it was always absent, so ctx_frames stayed 0 and the trim path
+                # never ran -- with codec_left_context_frames>0 each chunk then emitted
+                # its full ctx+chunk window, doubling the audio (the echo observed in
+                # commit f2cd6d8a). Fixing this unlocks streaming overlap-trim decode.
+                meta = info.get("meta", {}) if isinstance(info, dict) else {}
+                if "left_context_size" in meta:
+                    left_context_size[i] = int(meta["left_context_size"])
+                elif "left_context_size" in info:
+                    left_context_size[i] = int(info["left_context_size"])
 
         valid_codes: list[torch.Tensor] = []
         valid_indices: list[int] = []
@@ -297,9 +308,14 @@ class VieNeuCodecDecoder(nn.Module):
                 # DAC decoder (docs/Architecture.md Part A.6) -- avoids
                 # re-emitting audio from the overlap window on chunked/streaming
                 # decode (see stages.py's async_chunk wiring, TASK 12).
+                # The conv-decoder is position-invariant, so the suffix of the
+                # [ctx + new] window reproduces the standalone decode of `new`
+                # and stitches seamlessly with the previous chunk's tail.
                 samples_per_frame = wav.numel() / max(total_frames, 1)
                 trim_samples = int(round(ctx_frames * samples_per_frame))
-                wav = wav[trim_samples:]
+                trim_samples = max(0, min(trim_samples, int(wav.numel()) - 1))
+                if trim_samples > 0:
+                    wav = wav[trim_samples:]
 
             audios[idx] = wav.to(dtype=torch.float32, device="cpu")
 
