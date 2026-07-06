@@ -90,7 +90,7 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       hf_overrides:
         architectures: [VieNeuCodecDecoder]
-      enforce_eager: false
+      enforce_eager: true
       trust_remote_code: true
       async_scheduling: true
       enable_prefix_caching: false

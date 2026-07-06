@@ -92,11 +92,14 @@ stages:
       model_arch: VieNeuCodecDecoder
       hf_overrides:
         architectures: [VieNeuCodecDecoder]
-      # enforce_eager=false lets vLLM compile the codec forward graph.
-      # NeuCodec decode_code is a small conv-decoder -- compile gives a
-      # modest latency win per decode call. (Was eager because codec has
-      # no attention/KV cache, but compile still helps the conv layers.)
-      enforce_eager: false
+      # enforce_eager=true: NeuCodec decode_code builds CPU tensors from the
+      # input codes and copies them to CUDA inside the forward pass, which
+      # crashes under torch.compile + CUDA graph capture ("Cannot copy
+      # between CPU and CUDA tensors during CUDA graph capture unless the CPU
+      # tensor is pinned"). The codec stage has no attention/KV cache so
+      # cudagraph gives no benefit anyway -- keep it eager. Concurrency
+      # (max_num_seqs=4) is what speeds the codec stage up, not compile.
+      enforce_eager: true
       trust_remote_code: true
       async_scheduling: true
       enable_prefix_caching: false
