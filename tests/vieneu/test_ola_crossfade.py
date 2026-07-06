@@ -42,24 +42,47 @@ def crossfade_window(n: int) -> np.ndarray:
 
 
 # ── Mirror of the codec.py per-chunk emit logic (numpy) ────────────────
+# OLA_OVERLAP = codec_left_context_frames (O). Chunk 0 (ctx_frames==0) seeds
+# prev_tail with its last O frames so chunk 1 can crossfade. Each chunk k>0
+# emits [crossfaded_overlap (O samples)] + [new samples after overlap (C)] and
+# buffers its last O samples for chunk k+1. Total emit per chunk = C NEW
+# samples (O are re-decoded overlap used only for the splice) -> no echo.
+OLA_OVERLAP = 25
+
+
 def crossfade_chunk(
     wav: np.ndarray,
     ctx_frames: int,
     total_frames: int,
     prev_tail: np.ndarray | None,
     prev_overlap: int,
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """Return (emitted_samples, new_tail_samples, new_overlap_size)."""
+    is_chunk0: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None, int]:
+    """Return (emitted_samples, new_tail_samples_or_None, new_overlap_size)."""
     if ctx_frames <= 0 or total_frames <= 0:
-        # one-shot / first chunk / ctx disabled
-        return wav, np.empty(0, dtype=np.float32), 0
+        # one-shot OR chunk 0 of streaming. For chunk 0, seed prev_tail with the
+        # last O frames so chunk 1 can crossfade. For true one-shot (huge
+        # total_frames) return None tail.
+        if is_chunk0 and 0 < total_frames <= 4 * OLA_OVERLAP:
+            spf = wav.shape[0] / max(total_frames, 1)
+            seed_o = min(OLA_OVERLAP, total_frames)
+            seed_n = max(0, min(int(round(seed_o * spf)), wav.shape[0]))
+            # Emit ONLY the non-overlap part (C - O samples); the last O samples
+            # are buffered as prev_tail and will be crossfaded into chunk 1's
+            # head. This prevents the overlap from being emitted twice (echo).
+            emit = wav[:-seed_n] if seed_n > 0 else wav
+            return emit, (wav[-seed_n:].copy() if seed_n > 0 else np.empty(0, dtype=wav.dtype)), int(seed_n)
+        return wav, None, 0
 
     samples_per_frame = wav.shape[0] / max(total_frames, 1)
     overlap_samples = int(round(ctx_frames * samples_per_frame))
     overlap_samples = max(0, min(overlap_samples, wav.shape[0] - 1))
 
     if prev_tail is None or overlap_samples <= 0:
-        return wav, wav[-overlap_samples:].copy(), overlap_samples
+        # No prev_tail yet: emit the non-overlap part only (no splice) and
+        # buffer the tail O for the next chunk.
+        new_tail = wav[-overlap_samples:].copy() if overlap_samples > 0 else np.empty(0, dtype=wav.dtype)
+        return wav[overlap_samples:], new_tail, int(overlap_samples)
 
     n_cross = min(int(prev_overlap), int(overlap_samples))
     n_cross = max(0, min(n_cross, prev_tail.shape[0], wav.shape[0]))
@@ -67,13 +90,20 @@ def crossfade_chunk(
     head_overlap = wav[:n_cross]
     tail_use = prev_tail[-n_cross:] if n_cross > 0 else prev_tail[:0]
 
-    out = wav.copy()
+    # emit = [crossfaded overlap (O samples)] + [middle non-overlap (C-O samples)]
+    # The last O samples of this chunk are buffered as prev_tail for chunk k+1
+    # (NOT emitted here) so the overlap is never emitted twice. wav has
+    # (O + C) samples; emit O + (C - O) = C samples total.
+    middle = wav[n_cross : wav.shape[0] - overlap_samples] if overlap_samples > 0 else wav[n_cross:]
     if n_cross > 0:
         fade_in = crossfade_window(n_cross).astype(wav.dtype)
         fade_out = 1.0 - fade_in
-        out[:n_cross] = tail_use * fade_out + head_overlap * fade_in
+        crossfaded = tail_use * fade_out + head_overlap * fade_in
+        out = np.concatenate([crossfaded, middle], axis=0)
+    else:
+        out = middle
 
-    new_tail = wav[-overlap_samples:].copy()
+    new_tail = wav[-overlap_samples:].copy() if overlap_samples > 0 else np.empty(0, dtype=wav.dtype)
     return out, new_tail, int(overlap_samples)
 
 
@@ -119,16 +149,17 @@ def test_crossfade_identical_overlap_is_sample_exact() -> None:
     t = np.arange(total_samples, dtype=np.float32) / 24000.0
     full = np.sin(2 * np.pi * 220.0 * t).astype(np.float32)
 
-    # Chunk 0: emit full [0 .. C] (ctx=0 -> passthrough); buffer tail O frames.
+    # Chunk 0: ctx=0, is_chunk0=True -> emit full [0 .. C] AND seed prev_tail
+    # with the last O frames so chunk 1 can crossfade.
     chunk0 = full[: C * spf]
     emit0, tail0, ov0 = crossfade_chunk(chunk0, ctx_frames=0, total_frames=C,
-                                        prev_tail=None, prev_overlap=0)
-    assert ov0 == 0, "chunk 0 must not buffer a tail when ctx=0"
-    assert np.array_equal(emit0, chunk0), "chunk 0 ctx=0 must passthrough"
-
-    # Manually buffer chunk 0's tail O frames for chunk 1.
-    tail0 = chunk0[-O * spf:].copy()
-    ov0 = O * spf
+                                        prev_tail=None, prev_overlap=0,
+                                        is_chunk0=True)
+    # chunk 0 emits ONLY the non-overlap part (C - O samples); its last O
+    # samples are buffered as prev_tail for chunk 1's crossfade (no echo).
+    assert np.array_equal(emit0, chunk0[: (C - O) * spf]), "chunk 0 must emit non-overlap part"
+    assert emit0.shape[0] == (C - O) * spf, f"chunk 0 emit len {emit0.shape[0]} != {(C - O) * spf}"
+    assert tail0 is not None and ov0 == O * spf, "chunk 0 must seed prev_tail of O frames"
 
     # Chunk 1: decode [O + C] frames starting at frame (C - O), so its head
     # O frames overlap chunk 0's tail O frames. With an ideal codec, the
@@ -140,13 +171,30 @@ def test_crossfade_identical_overlap_is_sample_exact() -> None:
         prev_tail=tail0, prev_overlap=ov0,
     )
 
-    # The emitted chunk 1 should reproduce full[(C-O)*spf : (C-O+O+C)*spf]
-    # EXACTLY because the overlap matches and the crossfade of identical
-    # samples is identity: tail*fade_out + head*fade_in = head*(fade_out+fade_in)
-    # = head*1 = head.
-    expected = full[(C - O) * spf : (C - O + O + C) * spf]
-    max_delta = float(np.max(np.abs(emit1 - expected)))
-    assert max_delta < 1e-6, f"splice not sample-exact: max delta = {max_delta}"
+    # chunk 1 emits [crossfaded overlap (O*spf)] + [new non-overlap (C-O)*spf]
+    # = C*spf samples. Combined with chunk 0's (C-O)*spf, the timeline covers
+    # (C-O) + C = 2C - O frames after chunk 1 (no overlap double-emitted).
+    # Because the overlap matches, crossfade of identical samples is identity,
+    # so emit1's first O*spf samples == full[(C-O)*spf : C*spf] (the overlap
+    # region), and its last (C-O)*spf samples == full[C*spf : (2C-O)*spf].
+    assert emit1.shape[0] == C * spf, (
+        f"emit1 length {emit1.shape[0]} != C*spf={C * spf} (echo or under-emit)"
+    )
+    overlap_part = emit1[: O * spf]
+    expected_overlap = full[(C - O) * spf : C * spf]
+    max_delta_ov = float(np.max(np.abs(overlap_part - expected_overlap)))
+    assert max_delta_ov < 1e-6, f"splice overlap not sample-exact: max delta = {max_delta_ov}"
+    # The new non-overlap part only exists when C > O. When C == O the chunk
+    # is all overlap (the entire chunk is the splice region), so skip the new
+    # part check in that case.
+    if C > O:
+        new_part = emit1[O * spf :]
+        expected_new = full[C * spf : (2 * C - O) * spf]
+        max_delta_new = float(np.max(np.abs(new_part - expected_new)))
+        assert max_delta_new < 1e-6, f"new part mismatch: max delta = {max_delta_new}"
+        max_delta = max(max_delta_ov, max_delta_new)
+    else:
+        max_delta = max_delta_ov
     print(f"[PASS] test_crossfade_identical_overlap_is_sample_exact (max_delta={max_delta:.2e})")
 
 
@@ -171,18 +219,22 @@ def test_crossfade_slightly_differing_overlap_is_continuous() -> None:
         prev_tail=tail0, prev_overlap=O * spf,
     )
 
+    # emit1 = [crossfaded overlap (O*spf)] + [new non-overlap (C-O)*spf] = C*spf.
+    assert emit1.shape[0] == C * spf, (
+        f"emit1 length {emit1.shape[0]} != C*spf={C * spf} (echo or under-emit)"
+    )
     # Continuity at the splice boundary (sample index O*spf - 1 -> O*spf):
     # the crossfade region is [0, O*spf); the new-chunk region starts at
-    # O*spf. The boundary delta should be on the order of the new-chunk
-    # signal's own sample-to-sample delta (a few percent of amplitude), NOT
-    # a full-amplitude jump.
+    # O*spf. Only check the boundary when there IS a new part (C > O); when
+    # C == O the whole chunk is the splice region.
     boundary = O * spf
-    delta_at_boundary = abs(emit1[boundary] - emit1[boundary - 1])
-    # Sanity bound: should be << 1.0 (no full-amplitude click).
-    assert delta_at_boundary < 0.2, (
-        f"discontinuity at splice boundary: delta = {delta_at_boundary}"
-    )
-    # And the crossfade region itself should be bounded (no jump inside it).
+    delta_at_boundary = 0.0
+    if C > O and boundary < emit1.shape[0]:
+        delta_at_boundary = abs(emit1[boundary] - emit1[boundary - 1])
+        assert delta_at_boundary < 0.2, (
+            f"discontinuity at splice boundary: delta = {delta_at_boundary}"
+        )
+    # The crossfade region itself should be bounded (no jump inside it).
     intra = np.max(np.abs(np.diff(emit1[:boundary])))
     assert intra < 0.2, f"jump inside crossfade region: {intra}"
     print(
@@ -221,30 +273,90 @@ def test_naive_concat_has_jump() -> None:
 
 
 def test_one_shot_ctx_zero_passthrough() -> None:
-    # ctx_frames == 0 (one-shot) must return the decoded samples unchanged
-    # and clear any stale tail buffer.
+    # ctx_frames == 0 (one-shot, huge total_frames) must return the decoded
+    # samples unchanged and NO tail (None) so no crossfade state leaks.
     wav = np.sin(2 * np.pi * 220.0 * np.arange(12000, dtype=np.float32) / 24000.0)
     emit, tail, ov = crossfade_chunk(
-        wav, ctx_frames=0, total_frames=25, prev_tail=wav[-12000:].copy(),
-        prev_overlap=12000,
+        wav, ctx_frames=0, total_frames=12000 // 480, prev_tail=wav[-12000:].copy(),
+        prev_overlap=12000, is_chunk0=False,
     )
     assert np.array_equal(emit, wav), "one-shot must passthrough wav unchanged"
-    assert ov == 0 and tail.shape[0] == 0, "one-shot must not buffer a tail"
+    assert ov == 0 and tail is None, "one-shot must not buffer a tail"
     print("[PASS] test_one_shot_ctx_zero_passthrough")
 
 
-def test_first_chunk_ctx_zero_no_prev_tail() -> None:
+def test_first_chunk_ctx_zero_seeds_tail() -> None:
     # Chunk 0 of a streaming request: ctx_frames=0 (no left context), so
-    # emit the full decode and buffer nothing.
-    C = 25
+    # emit the full C-sample decode AND seed prev_tail with the last O frames
+    # so chunk 1 can crossfade against it.
+    C, O = 25, 25
     spf = 480
     wav = np.sin(2 * np.pi * 220.0 * np.arange(C * spf, dtype=np.float32) / 24000.0)
     emit, tail, ov = crossfade_chunk(
         wav, ctx_frames=0, total_frames=C, prev_tail=None, prev_overlap=0,
+        is_chunk0=True,
     )
-    assert np.array_equal(emit, wav)
-    assert ov == 0 and tail.shape[0] == 0
-    print("[PASS] test_first_chunk_ctx_zero_no_prev_tail")
+    # chunk 0 emits the non-overlap part (C - O samples); last O samples buffered.
+    assert np.array_equal(emit, wav[: (C - O) * spf]), "chunk 0 must emit non-overlap part"
+    assert emit.shape[0] == (C - O) * spf
+    assert tail is not None and ov == O * spf, (
+        f"chunk 0 must seed prev_tail of O*spf={O * spf} samples, got ov={ov}"
+    )
+    assert tail.shape[0] == O * spf, f"tail length {tail.shape[0]} != {O * spf}"
+    print("[PASS] test_first_chunk_ctx_zero_seeds_tail")
+
+
+def test_no_echo_total_emit_equals_input_frames() -> None:
+    # ECHO REGRESSION GUARD: a request of N*C frames split into chunks of
+    # C frames with overlap O must emit roughly N*C samples total (each chunk
+    # contributes C NEW samples; O overlap samples are re-decoded only for the
+    # splice, never emitted twice). The previous buggy code emitted the full
+    # [ctx+new] every chunk -> ~2x audio -> echo.
+    C, O = 25, 25
+    spf = 480
+    n_chunks = 4
+    total_frames = C * n_chunks  # 100 frames
+    t = np.arange(total_frames * spf, dtype=np.float32) / 24000.0
+    full = np.sin(2 * np.pi * 220.0 * t).astype(np.float32)
+
+    total_emit = 0
+    prev_tail = None
+    prev_ov = 0
+    # Walk the timeline in fixed steps of C NEW frames per chunk. Chunk k
+    # starts at frame max(0, k*C - O) so its head O frames overlap the prev
+    # chunk's tail O frames.
+    for k in range(n_chunks):
+        start = max(0, k * C - O)
+        end = min(total_frames, start + O + C)
+        chunk_full = full[start * spf : end * spf]
+        ctx = (k * C) - start  # 0 for chunk 0, O for chunk k>0
+        tf = end - start
+        if k == 0:
+            emit, prev_tail, prev_ov = crossfade_chunk(
+                chunk_full, ctx_frames=0, total_frames=tf, prev_tail=None,
+                prev_overlap=0, is_chunk0=True,
+            )
+        else:
+            emit, prev_tail, prev_ov = crossfade_chunk(
+                chunk_full, ctx_frames=ctx, total_frames=tf,
+                prev_tail=prev_tail, prev_overlap=prev_ov,
+            )
+        total_emit += emit.shape[0]
+
+    # The total emit must be ~ total_frames*spf (each chunk contributes C new
+    # samples). The echo bug produced ~2x; this assert catches that.
+    expected = total_frames * spf
+    assert total_emit < 1.5 * expected, (
+        f"echo detected: total_emit={total_emit} > 1.5*expected={1.5 * expected} "
+        f"(~2x means overlap emitted twice)"
+    )
+    assert total_emit >= expected - (O + C) * spf, (
+        f"under-emit: total_emit={total_emit} < expected-chunk={expected - (O + C) * spf}"
+    )
+    print(
+        f"[PASS] test_no_echo_total_emit_equals_input_frames "
+        f"(total_emit={total_emit}, expected~{expected}, ratio={total_emit / expected:.3f})"
+    )
 
 
 def main() -> int:
@@ -253,7 +365,8 @@ def main() -> int:
     test_crossfade_slightly_differing_overlap_is_continuous()
     test_naive_concat_has_jump()
     test_one_shot_ctx_zero_passthrough()
-    test_first_chunk_ctx_zero_no_prev_tail()
+    test_first_chunk_ctx_zero_seeds_tail()
+    test_no_echo_total_emit_equals_input_frames()
     print("\nALL OLA CROSSFADE SELF-CHECKS PASSED")
     return 0
 

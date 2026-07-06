@@ -194,6 +194,17 @@ class VieNeuCodecDecoder(nn.Module):
         self._output_sample_rate: int = self.codec_config.sample_rate
         self._num_codebooks: int = self.codec_config.num_codebooks
         self._logged_codec_stats = False
+        # Streaming chunk config from the connector (codec_chunk_frames=C,
+        # codec_left_context_frames=O). Needed so chunk 0 (ctx_frames==0) knows
+        # O to seed the prev_tail buffer for chunk 1's crossfade. Same read
+        # pattern as glm_tts_dit_wrapper._connector_chunk_config.
+        cc = getattr(vllm_config.model_config, "stage_connector_config", None)
+        extra = (cc or {}).get("extra") if isinstance(cc, dict) else getattr(cc, "extra", None)
+        if not isinstance(extra, dict):
+            extra = {}
+        cf = extra.get("codec_chunk_frames", 25)
+        self._ola_chunk_frames = int(cf[0]) if isinstance(cf, list) else int(cf)
+        self._ola_overlap_frames = int(extra.get("codec_left_context_frames", 25))
         # Streaming overlap-add crossfade state. Maps req_id -> (tail_samples,
         # tail_overlap_samples). ``tail_samples`` is the last O frames worth of
         # decoded samples from the previous chunk (the overlap that will be
@@ -396,34 +407,65 @@ class VieNeuCodecDecoder(nn.Module):
             wav = wav.reshape(-1).to(dtype=torch.float32)
 
             if ctx_frames <= 0 or total_frames <= 0:
-                # ONE-SHOT / first chunk / ctx disabled: no overlap to crossfade.
-                # Emit the full decode unchanged and clear any stale tail for
-                # this req_id (e.g. a previous streaming request whose finish
-                # signal we missed, or a one-shot fallback reusing the same id).
-                self._prev_tail.pop(rid, None)
-                audios[idx] = wav.to(dtype=torch.float32, device="cpu")
+                # ONE-SHOT (codec_chunk_frames huge, ctx disabled) OR the first
+                # streaming chunk (chunk 0 has no left context from the
+                # connector). We emit the full decode (C samples) unchanged.
+                # For chunk 0 of a streaming request we ALSO seed prev_tail with
+                # the last ``min(O, total_frames-1)`` frames so chunk 1 can
+                # crossfade against it -- O is read from the connector config
+                # (codec_left_context_frames) stashed on the module at init.
+                # For true one-shot (huge total_frames) we clear stale tail.
+                o_cfg = int(getattr(self, "_ola_overlap_frames", 0))
+                if o_cfg > 0 and 0 < total_frames <= 4 * o_cfg:
+                    # chunk 0 of streaming: emit ONLY the non-overlap part
+                    # (C - O samples); the last O samples are buffered as
+                    # prev_tail so chunk 1 can crossfade against them. This
+                    # prevents the overlap from being emitted twice (echo).
+                    seed_o = min(o_cfg, total_frames)
+                    spf = wav.numel() / max(total_frames, 1)
+                    seed_samples = max(0, min(int(round(seed_o * spf)), int(wav.numel())))
+                    self._prev_tail[rid] = (
+                        wav[-seed_samples:].clone().cpu() if seed_samples > 0 else wav[:0].clone().cpu(),
+                        int(seed_samples),
+                    )
+                    emit_wav = wav[: int(wav.numel()) - seed_samples] if seed_samples > 0 else wav
+                    audios[idx] = emit_wav.to(dtype=torch.float32, device="cpu")
+                else:
+                    # One-shot: clear stale tail, emit full decode unchanged.
+                    self._prev_tail.pop(rid, None)
+                    audios[idx] = wav.to(dtype=torch.float32, device="cpu")
                 continue
 
-            # STREAMING overlap-add crossfade.
-            # ``wav`` is the decode of ``[ctx(=O) + new(=C)]`` frames. Its first
-            # ``O * samples_per_frame`` samples are the re-decoded overlap that
-            # should match the previous chunk's tail (when O >= conv receptive
-            # field they match exactly). Crossfade those with the buffered
-            # ``prev_tail`` in the sample domain, then emit:
-            #   [crossfaded_overlap] + [remaining new samples]
-            # and buffer this chunk's tail ``O`` frames for the next crossfade.
+            # STREAMING overlap-add crossfade (no echo).
+            # ``wav`` is the decode of ``[ctx(=O) + new(=C)]`` frames (O+C
+            # samples). Its first ``O * samples_per_frame`` samples (head_overlap)
+            # re-decode the previous chunk's tail and should match it exactly
+            # when O >= conv receptive field. Crossfade head_overlap with the
+            # buffered ``prev_tail`` in the sample domain, then emit ONLY:
+            #   [crossfaded_overlap (O samples)] + [middle non-overlap (C-O samples)]
+            # i.e. ``C`` samples total (O + (C - O)). The previous chunk emitted
+            # its own ``C - O`` non-overlap samples and buffered its last ``O``
+            # as prev_tail -- it did NOT emit that tail. So the timeline is:
+            #   chunk 0   emit: [wav minus its last O]            (C - O samples)
+            #   chunk k   emit: [crossfaded overlap (O)] + [middle (C - O)]  = C
+            # Each chunk contributes exactly C NEW samples (the O overlap is
+            # re-decoded only for the splice, never emitted twice), so total
+            # audio = ~N*C, NOT 2*N*C. The previous code emitted the full
+            # [ctx+new] every chunk -> ~2x audio -> echo (WAV accounting showed
+            # codec_frames=455 for codec_codes_emitted=230, ~2x).
             samples_per_frame = wav.numel() / max(total_frames, 1)
             overlap_samples = int(round(ctx_frames * samples_per_frame))
             overlap_samples = max(0, min(overlap_samples, int(wav.numel()) - 1))
 
             prev_entry = self._prev_tail.get(rid)
             if prev_entry is None or overlap_samples <= 0:
-                # First chunk of this request (chunk 0): the connector did not
-                # feed left context for chunk 0, so ctx_frames here will be 0
-                # and we hit the branch above. Defensive fallback: if we somehow
-                # get here with no prev_tail, emit the full decode unchanged.
-                self._prev_tail[rid] = (wav[-overlap_samples:].clone().cpu(), overlap_samples)
-                audios[idx] = wav.to(dtype=torch.float32, device="cpu")
+                # No prev_tail yet: emit the non-overlap part only (no splice)
+                # and buffer the tail O for the next chunk.
+                self._prev_tail[rid] = (
+                    wav[-overlap_samples:].clone().cpu() if overlap_samples > 0 else wav[:0].clone().cpu(),
+                    int(overlap_samples),
+                )
+                audios[idx] = wav[overlap_samples:].to(dtype=torch.float32, device="cpu")
                 continue
 
             prev_tail, prev_overlap = prev_entry
@@ -439,18 +481,25 @@ class VieNeuCodecDecoder(nn.Module):
             # the previous chunk buffered more than we need now).
             tail_use = prev_tail[-n_cross:] if n_cross > 0 else prev_tail[:0]
 
-            out = wav.clone()
+            # Emit [crossfaded overlap (O)] + [middle non-overlap (C-O)].
+            # ``middle`` excludes both the head overlap AND the tail overlap
+            # (the tail overlap is buffered for chunk k+1, NOT emitted here).
+            if overlap_samples > 0:
+                middle = wav[n_cross : int(wav.numel()) - overlap_samples]
+            else:
+                middle = wav[n_cross:]
             if n_cross > 0:
                 fade_in = _crossfade_window(n_cross).to(head_overlap.device, head_overlap.dtype)
                 fade_out = 1.0 - fade_in
-                # Bring prev_tail onto the same device/dtype as head_overlap
-                # for the blend, then move back to cpu for the connector path.
                 tail_use_dev = tail_use.to(head_overlap.device, head_overlap.dtype)
-                out[:n_cross] = tail_use_dev * fade_out + head_overlap * fade_in
+                crossfaded = tail_use_dev * fade_out + head_overlap * fade_in
+                out = torch.cat([crossfaded, middle], dim=0)
+            else:
+                out = middle
 
             # Buffer this chunk's tail overlap for the NEXT crossfade. Keep it
             # on CPU so the buffer doesn't pin GPU memory across chunks.
-            new_tail = wav[-overlap_samples:].clone().cpu()
+            new_tail = wav[-overlap_samples:].clone().cpu() if overlap_samples > 0 else wav[:0].clone().cpu()
             self._prev_tail[rid] = (new_tail, int(overlap_samples))
 
             audios[idx] = out.to(dtype=torch.float32, device="cpu")
